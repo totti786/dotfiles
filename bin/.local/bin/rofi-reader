@@ -127,7 +127,7 @@ main(){
     done
 	
 	# Show the rofi application launcher with the 'Books' category
-	rofi -show drun -drun-categories Books -theme rofi-reader
+	rofi -show drun -drun-categories Books -theme rofi-reader 2>/dev/null
 }
 
 # Command-line argument handling

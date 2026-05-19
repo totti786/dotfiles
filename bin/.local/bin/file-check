@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+# Define directories to search
+directories=(ags bspwm openbox i3 polybar jgmenu rofi)
+
+# Find and make script files executable
+for dir in "${directories[@]}"; do
+    find "$HOME/.config/$dir" "$HOME/.local/bin" -type f 2>/dev/null | \
+    while read -r file; do
+        if file "$file" | grep -q "script"; then
+            chmod +x "$file"
+        fi
+    done
+done

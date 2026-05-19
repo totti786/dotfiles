@@ -105,7 +105,7 @@ toggle_ambient_gamma(){
 
 change_temp(){
 	busctl --user set-property \
-	org.clight.clight /org/clight/clight/Conf/Gamma org.clight.clight.Conf.Gamma NightTemp 'i' "$1"
+	org.clight.clight /org/clight/clight/Conf/Gamma org.clight.clight.Conf.Gamma DayTemp 'i' "$1"
 }
 
 if [[ -z "$(pgrep clight)" ]]; then
@@ -150,7 +150,8 @@ case "$1" in
     ;;
     "--increase-gamma")
        	temperature="$(get_value Temp)"
-        change_temp $((temperature +100))
+       	echo $temperature
+        change_temp $((temperature + 100))
     ;;
     "--decrease-gamma")
         temperature="$(get_value Temp)"

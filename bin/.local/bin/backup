@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+. "$HOME/.cache/wal/colors.sh"
+
+apps=(quickshell hypr polybar openbox zathura dunst alacritty picom rofi bspwm sxhkd jgmenu conky i3) 
+DIR="$HOME/.dots/.config/"
+BackupDir="$HOME/.dotfiles/"
+
+for bapps in "${apps[@]}"; do
+	cp -r $DIR/$bapps $BackupDir/cfg/
+done
+
+cp -r $DIR/geany/colorschemes/Pywal.conf $BackupDir/cfg/geany/colorschemes/Pywal.conf
+cp -r $DIR/copyq/copyq.conf $BackupDir/cfg/copyq/copyq.conf
+rm -R $BackupDir/bin/.local/bin/ && cp -r $HOME/.dots/.local/bin $BackupDir/bin/.local
+
+cp "$wallpaper" "$BackupDir/deps/background.jpg"
+
+cp $wallpaper $BackupDir/deps/Chili/components/artwork/background.jpg

@@ -3,12 +3,12 @@
 # Configuration
 APIKEY="u4YNdj6N0M7nkrM2Pbz7fHAY0EYIT5WL"
 LOCATION="$HOME/Pictures/Wallpapers/walldl"
-CATEGORIES="111"         # General, Anime, People
+CATEGORIES="110"         # General, Anime, People
 FILTER="100"             # 1st=SFW, 2nd=Sketchy, 3rd=NSFW
 RESOLUTION="1920x1080"   # Preferred resolution
 ATLEAST="1920x1080"      # Minimum resolution
 ASPECTRATIO="16x9"       # Aspect ratio
-TOPRANGE="1m"            # 1d, 3d, 1w,1M, 3M, 6M, 1y
+TOPRANGE="1w"            # 1d, 3d, 1w,1M, 3M, 6M, 1y
 ORDER="desc"             # Sorting order
 THUMBS=64                # Results per page (max 64)
 MAX_PARALLEL=10          # Number of concurrent downloads
@@ -51,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         -n|--number) WPNUM="$2"; shift 2 ;;
         -t|--tag) TAG="$2"; shift 2 ;;
         -m|--mode) MODE="$2"; shift 2 ;;
+        -a|--anime) CATEGORIES="010"; shift ;;
         -u|--unsafe) FILTER="001"; shift ;;
 		-l|--like)
 		    input="$2"
@@ -122,6 +123,7 @@ while (( downloaded_count < WPNUM )); do
     URL+="&purity=$FILTER"
     #URL+="&atleast=$ATLEAST"
     URL+="&sorting=$MODE"
+    URL+="&ratios=landscape"
 	URL+="&order=$ORDER"
     URL+="&page=$page"
     [[ "$MODE" == "toplist" ]] && URL+="&topRange=$TOPRANGE"
@@ -176,5 +178,12 @@ while (( downloaded_count < WPNUM )); do
 done
 
 wait
-[[ "$PRINT_PATH" == true ]] && echo "$FILEPATH"
-notify-send "Download Complete" "$downloaded_count wallpapers saved to $LOCATION"
+[[ "$PRINT_PATH" == true ]] && echo "$FILEPATH" && exit 0
+
+if [[ "$downloaded_count" -gt 1 ]]; then
+	notify-send -a "walldl" -r 72 "Download Complete" "$downloaded_count wallpapers saved to $LOCATION"
+else
+	action=$(notify-send -a "walldl" -r 72 -i "$FILEPATH" "Download Complete" "Wallpapers saved to $LOCATION" --action="Open")
+	[[ "$action" == 0 ]] &&  xdg-open "$FILEPATH" 2>/dev/null
+fi
+
