@@ -12,7 +12,7 @@ fi
 
 declare -a minimal=(
 	acpi alacritty autotiling axel base-devel bc blueman bluez bluez-utils brightnessctl bspwm btop \
-	conky copyq dmenu drawing dunst envycontrol fcitx5 fcitx5-configtool fd feh file-roller firefox flameshot \
+	conky copyq ddcutil dmenu drawing dunst envycontrol fcitx5 fcitx5-configtool fd feh file-roller firefox flameshot \
 	fluent-cursor-theme-git font-manager fzf g4music-git gammastep geany gnome-calculator gnome-desktop gnome-desktop-4 \
 	gnome-disk-utility gnome-epub-thumbnailer gping gpu-screen-recorder jq gpick grep python-gtts html-xml-utils htop \
 	i3lock-color i3-wm imagemagick jgmenu kdeconnect libplasma linux-wifi-hotspotkvantum kvantum-qt5 loupe man moreutils mpv \
