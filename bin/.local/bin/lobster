@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 
-LOBSTER_VERSION="4.6.0"
+LOBSTER_VERSION="4.6.7"
 
 ### General Variables ###
 config_file="$HOME/.config/lobster/lobster_config.sh"
@@ -19,6 +19,7 @@ nl='
 BACK_CODE=10
 FORWARD_CODE=11
 API_URL="https://dec.eatmynerds.live"
+API_FALLBACK_URL="https://decrypt.broggl.farm"
 
 ### Notifications ###
 command -v notify-send >/dev/null 2>&1 && notify="true" || notify="false" # check if notify-send is installed
@@ -174,6 +175,7 @@ configuration() {
     [ -z "$history" ] && history=false
     [ -z "$use_external_menu" ] && use_external_menu="false"
     [ -z "$image_preview" ] && image_preview="false"
+    [ -z "$high_quality_image_preview" ] && high_quality_image_preview="false"
     [ -z "$debug" ] && debug="false"
     [ -z "$preview_window_size" ] && preview_window_size=right:60%:wrap
     if [ -z "$use_ueberzugpp" ]; then
@@ -297,7 +299,7 @@ EOF
     }
     search() {
         response=$(curl -s "https://${base}/search/$1" | $sed ':a;N;$!ba;s/\n//g;s/class="flw-item"/\n/g' |
-            $sed -nE "s@.*img data-src=\"([^\"]*)\".*<a href=\".*/(tv|movie)/watch-.*-([0-9]*)\".*title=\"([^\"]*)\".*class=\"fdi-item\">([^<]*)</span>.*@\1\t\3\t\2\t\4 [\5]@p")
+            $sed -nE "s@.*img data-src=\"([^\"]*)\".*<a href=\"/((tv|movie)/watch-[^\"]*-([0-9]*))\".*title=\"([^\"]*)\".*class=\"fdi-item\">([^<]*)</span>.*@\1\t\4\t\3\t\5 [\6]\t\2@p")
         [ -z "$response" ] && send_notification "Error" "1000" "" "No results found" && exit 1
     }
     choose_search() {
@@ -317,6 +319,13 @@ EOF
             maybe_download_thumbnails "$response"
             select_desktop_entry ""
             rc=$?
+
+            choice=$(printf "%s\n" "$response" | awk -F '\t' -v id="$media_id" '$2 == id { print; exit }')
+            image_link=$(printf "%s" "$choice" | cut -f1)
+            media_id=$(printf "%s" "$choice" | cut -f2)
+            media_type=$(printf "%s" "$choice" | cut -f3)
+            title=$(printf "%s" "$choice" | cut -f4 | $sed -nE "s@(.*) \[.*\]@\1@p")
+            api_media_id=$(printf "%s" "$choice" | cut -f5)
         else
             if [ "$use_external_menu" = "true" ]; then
                 choice=$(printf "%s" "$response" | rofi -kb-mode-next "" -kb-mode-previous "" -kb-custom-1 Shift+Left -kb-custom-2 Shift+Right -dmenu -i -p "" -mesg "Choose a Movie or TV Show" -display-columns 4)
@@ -336,8 +345,9 @@ EOF
             fi
             image_link=$(printf "%s" "$choice" | cut -f1)
             media_id=$(printf "%s" "$choice" | cut -f2)
-            title=$(printf "%s" "$choice" | $sed -nE "s@.* *(tv|movie)[[:space:]]*(.*) \[.*\]@\2@p")
-            media_type=$(printf "%s" "$choice" | $sed -nE "s@.* *(tv|movie)[[:space:]]*(.*) \[.*\]@\1@p")
+            media_type=$(printf "%s" "$choice" | cut -f3)
+            title=$(printf "%s" "$choice" | cut -f4 | $sed -nE "s@(.*) \[.*\]@\1@p")
+            api_media_id=$(printf "%s" "$choice" | cut -f5)
         fi
 
         # Check if back button pressed
@@ -430,7 +440,7 @@ EOF
         tab="$(printf '\t')"
 
         # keep the while-loop in the current shell
-        while IFS="$tab" read -r cover_url id type title; do
+        while IFS="$tab" read -r cover_url id type title _; do
             [ -z "$cover_url" ] && continue # skip empty lines
             poster="$images_cache_dir/  $title ($type)  $id.jpg"
             [ ! -f "$poster" ] && need_dl=1 && break # one miss is enough
@@ -443,11 +453,15 @@ EOF
             download_thumbnails "$1"
         fi
     }
+    poster_path_for_media() {
+        printf "%s/  %s (%s)  %s.jpg\n" "$images_cache_dir" "$1" "$2" "$3"
+    }
     download_thumbnails() {
         pids=""
+        tab="$(printf '\t')"
 
         # run the while-loop in the current shell
-        while IFS='     ' read -r cover_url id type title; do
+        while IFS="$tab" read -r cover_url id type title _; do
             [ -z "$cover_url" ] && continue                    # skip empty lines
             printf '%s\n' "$cover_url" >"$tmp_dir/image_links" # For Discord rich presence
 
@@ -455,7 +469,7 @@ EOF
             cover_url=$(printf '%s\n' "$cover_url" |
                 sed -E 's:/[0-9]+x[0-9]+/:/1000x1000/:')
 
-            poster_path="$images_cache_dir/  $title ($type)  $id.jpg"
+            poster_path=$(poster_path_for_media "$title" "$type" "$id")
             curl -s -o "$poster_path" "$cover_url" &
             pids="$pids $!"
 
@@ -477,6 +491,17 @@ EOF
     }
     # defaults to chafa
     image_preview_fzf() {
+        preview_input=$(
+            printf "%s\n" "$response" |
+                while IFS="$(printf '\t')" read -r cover_url id type title _; do
+                    [ -z "$cover_url" ] && continue
+                    poster_path=$(poster_path_for_media "$title" "$type" "$id")
+                    printf "%s\t%s (%s)\t%s\t%s\t%s\n" \
+                        "$poster_path" \
+                        "$title" "$type" "$id" "$type" "$title"
+                done
+        )
+
         if [ "$use_ueberzugpp" = "true" ]; then
             UB_PID_FILE="$tmp_dir.$(uuidgen)"
             if [ -z "$ueberzug_output" ]; then
@@ -486,7 +511,7 @@ EOF
             fi
             UB_PID="$(cat "$UB_PID_FILE")"
             LOBSTER_UEBERZUG_SOCKET="$ueberzugpp_tmp_dir/ueberzugpp-$UB_PID.socket"
-            choice=$(find "$images_cache_dir" -type f -exec basename {} \; | fzf --bind "shift-right:accept" --expect=shift-left --cycle -i -q "$1" --cycle --preview-window="$preview_window_size" --preview="ueberzugpp cmd -s $LOBSTER_UEBERZUG_SOCKET -i fzfpreview -a add -x $ueberzug_x -y $ueberzug_y --max-width $ueberzug_max_width --max-height $ueberzug_max_height -f $images_cache_dir/{}" --reverse --with-nth 2 -d "  ")
+            choice=$(printf "%s\n" "$preview_input" | fzf --bind "shift-right:accept" --expect=shift-left --cycle -i -q "$1" --cycle --preview-window="$preview_window_size" --preview="ueberzugpp cmd -s $LOBSTER_UEBERZUG_SOCKET -i fzfpreview -a add -x $ueberzug_x -y $ueberzug_y --max-width $ueberzug_max_width --max-height $ueberzug_max_height -f {1}" --reverse --with-nth 2 -d "$(printf '\t')")
             rc=$?
 
             case $choice in
@@ -500,14 +525,18 @@ EOF
             ueberzugpp cmd -s "$LOBSTER_UEBERZUG_SOCKET" -a exit
         else
             dep_ch "chafa" || true
-            # shellcheck disable=SC2154
-            [ "$TERM_PROGRAM" = "vscode" ] && fmt="-f sixels --margin-bottom 8" || fmt=""
-            [ -n "$chafa_dims" ] && dim="-s $chafa_dims"
-            choice=$(find "$images_cache_dir" -type f -exec basename {} \; | fzf \
+            [ "${TERM_PROGRAM:-}" = "vscode" ] && fmt="--margin-bottom 8"
+            dim="-s ${chafa_dims:-40x30}"
+            if [ "$high_quality_image_preview" = "true" ]; then
+                chafa_cmd="chafa --animate off $fmt $dim"
+            else
+                chafa_cmd="chafa --format symbols --polite on --animate off $fmt $dim"
+            fi
+            choice=$(printf "%s\n" "$preview_input" | fzf \
                 --bind "shift-right:accept" --expect=shift-left --cycle -i -q "$1" \
                 --preview-window="$preview_window_size" \
-                --preview="chafa $fmt $dim $images_cache_dir/{}" \
-                --reverse --with-nth 2 -d "  ")
+                --preview="$chafa_cmd {1}" \
+                --reverse --with-nth 2 -d "$(printf '\t')")
             rc=$?
 
             case $choice in
@@ -540,9 +569,9 @@ EOF
             image_preview_fzf "$1"
             rc=$?
             tput reset
-            media_id=$(printf "%s" "$choice" | $sed -nE 's@.* ([0-9]+)\.jpg@\1@p')
-            title=$(printf "%s" "$choice" | $sed -nE 's@^[[:space:]]*(.*) \((tv|movie)\)  [0-9]+\.jpg@\1@p')
-            media_type=$(printf "%s" "$choice" | $sed -nE 's@^[[:space:]]*(.*) \((tv|movie)\)  [0-9]+\.jpg@\2@p')
+            media_id=$(printf "%s" "$choice" | cut -f3)
+            media_type=$(printf "%s" "$choice" | cut -f4)
+            title=$(printf "%s" "$choice" | cut -f5)
         fi
         return "$rc"
     }
@@ -550,12 +579,11 @@ EOF
     ### Scraping/Decryption ###
     get_embed() {
         if [ "$media_type" = "movie" ]; then
-            # request to get the episode id
             movie_page="https://${base}"$(curl -s "https://${base}/ajax/movie/episodes/${media_id}" |
                 $sed ':a;N;$!ba;s/\n//g;s/class="nav-item"/\n/g' | $sed -nE "s@.*href=\"([^\"]*)\"[[:space:]]*title=\"${provider}\".*@\1@p")
             episode_id=$(printf "%s" "$movie_page" | $sed -nE "s_.*-([0-9]*)\.([0-9]*)\$_\2_p")
         fi
-        # request to get the embed
+
         embed_link=$(curl -s "https://${base}/ajax/episode/sources/${episode_id}" | $sed -nE "s_.*\"link\":\"([^\"]*)\".*_\1_p")
         if [ -z "$embed_link" ]; then
             send_notification "Error" "Could not get embed link"
@@ -564,9 +592,24 @@ EOF
     }
 
     extract_from_embed() {
-        api_url="${API_URL}/?url=${embed_link}"
-        json_data=$(curl -s "${api_url}")
-        video_link=$(printf "%s" "$json_data" | $sed -nE "s_.*\"file\":\"([^\"]*\.m3u8)\".*_\1_p" | head -1)
+        json_data=$(curl -s -X POST "${API_URL}" \
+            -H "Content-Type: application/json" \
+            -d "{\"url\": \"${embed_link}\", \"mediaId\": \"${api_media_id}\"}")
+        video_link=$(printf "%s" "$json_data" | $sed -nE "s_.*\"file\":\"([^\"]*\.m3u8)\".*_\1_p" | head -n 1)
+
+        if [ -z "$video_link" ]; then
+            send_notification "Using ${API_URL} failed, using ${API_FALLBACK_URL} instead"
+
+            json_data=$(curl -s -X POST "${API_FALLBACK_URL}" \
+                -H "Content-Type: application/json" \
+                -d "{\"url\": \"${embed_link}\", \"mediaId\": \"${api_media_id}\"}")
+            video_link=$(printf "%s" "$json_data" | $sed -nE "s_.*\"file\":\"([^\"]*\.m3u8)\".*_\1_p" | head -n 1)
+        fi
+
+        if [ -z "$video_link" ] && [ "$json_output" != "true" ]; then
+            send_notification "Error" "3000" "" "No sources returned, please try again later"
+            exit 1
+        fi
 
         [ -n "$quality" ] && video_link=$(printf "%s" "$video_link" | sed -e "s|/playlist.m3u8|/$quality/index.m3u8|")
 
@@ -582,7 +625,8 @@ EOF
                 subs_arg=""
             else
                 subs_arg="--sub-file"
-                num_subs=$(printf "%s" "$subs_links" | wc -l)
+                num_subs=$(printf "%s" "$subs_links" | wc -l | tr -d ' ')
+
                 if [ "$num_subs" -gt 0 ]; then
                     subs_links=$(printf "%s" "$subs_links" | sed -e "s/:/\\$path_thing:/g" -e "H;1h;\$!d;x;y/\n/$separator/" -e "s/$separator\$//")
                     subs_arg="--sub-files"
@@ -591,11 +635,13 @@ EOF
         fi
     }
 
-    ### History ###
     check_history() {
         if [ ! -f "$histfile" ]; then
-            [ "$image_preview" = "true" ] && send_notification "Now Playing" "5000" "$images_cache_dir/  $title ($media_type)  $media_id.jpg" "$title"
-            [ "$json_output" != "true" ] && send_notification "Now Playing" "5000" "" "$title"
+            if [ "$image_preview" = "true" ]; then
+                send_notification "Now Playing" "5000" "$images_cache_dir/  $title ($media_type)  $media_id.jpg" "$title"
+            elif [ "$json_output" != "true" ]; then
+                send_notification "Now Playing" "5000" "" "$title"
+            fi
             return
         fi
         case $media_type in
@@ -621,6 +667,7 @@ EOF
 
         esac
     }
+
     save_history() {
         [ -z "$image_link" ] && image_link="$(grep "$media_id" "$tmp_dir/image_links" | cut -f1)"
         case $media_type in
@@ -630,10 +677,10 @@ EOF
                     send_notification "Deleted from history" "5000" "" "$title"
                 else
                     if grep -q -- "$media_id" "$histfile" 2>/dev/null; then
-                        $sed -i "s|\t[0-9:]*\t$media_id|\t$position\t$media_id|1" "$histfile"
+                        $sed -i "s|^.*\t$media_id\t.*$|$title\t$position\t$media_id\t$media_type\t$image_link\t$api_media_id|" "$histfile"
                         send_notification "Saved to history" "5000" "" "$title"
                     else
-                        printf "%s\t%s\t%s\t%s\t%s\n" "$title" "$position" "$media_id" "$media_type" "$image_link" >>"$histfile"
+                        printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$title" "$position" "$media_id" "$media_type" "$image_link" "$api_media_id" >>"$histfile"
                         send_notification "Saved to history" "5000" "$images_cache_dir/  $title ($media_type)  $media_id.jpg" "$title"
                     fi
                 fi
@@ -659,10 +706,10 @@ EOF
 
                 # If entry exists in hist file then update it, otherwise append new line
                 if grep -q -- "$media_id" "$histfile" 2>/dev/null; then
-                    $sed -i "s|^.*\t$media_id\t.*$|$title\t$position\t$media_id\t$media_type\t$season_id\t$episode_id\t$season_title\t$episode_title\t$data_id\t$image_link|" "$histfile"
+                    $sed -i "s|^.*\t$media_id\t.*$|$title\t$position\t$media_id\t$media_type\t$season_id\t$episode_id\t$season_title\t$episode_title\t$data_id\t$image_link\t$api_media_id|" "$histfile"
                 else
-                    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$title" "$position" "$media_id" "$media_type" \
-                        "$season_id" "$episode_id" "$season_title" "$episode_title" "$data_id" "$image_link" >>"$histfile"
+                    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$title" "$position" "$media_id" "$media_type" \
+                        "$season_id" "$episode_id" "$season_title" "$episode_title" "$data_id" "$image_link" "$api_media_id" >>"$histfile"
                 fi
                 ;;
             *) notify-send "Error" "Unknown media type" ;;
@@ -693,14 +740,17 @@ EOF
 
             maybe_download_thumbnails "$history_response"
             select_desktop_entry ""
+            line=$(grep -m1 -F "$media_id" "$histfile")
             if [ "$media_type" = "tv" ]; then
-                line=$(grep -m1 -F "$media_id" "$histfile")
                 season_id=$(printf "%s" "$line" | cut -f5)
                 episode_id=$(printf "%s" "$line" | cut -f6)
                 season_title=$(printf "%s" "$line" | cut -f7)
                 episode_title=$(printf "%s" "$line" | cut -f8)
                 data_id=$(printf "%s" "$line" | cut -f9)
                 image_link=$(printf "%s" "$line" | cut -f10)
+                api_media_id=$(printf "%s" "$line" | cut -f11)
+            else
+                api_media_id=$(printf "%s" "$line" | cut -f6)
             fi
         else
             choice=$($sed -n "1h;1!{x;H;};\${g;p;}" "$histfile" | nl -w 1 | nth "Choose an entry: ")
@@ -716,6 +766,9 @@ EOF
                 episode_title=$(printf "%s" "$choice" | cut -f8)
                 data_id=$(printf "%s" "$choice" | cut -f9)
                 image_link=$(printf "%s" "$choice" | cut -f10)
+                api_media_id=$(printf "%s" "$choice" | cut -f11)
+            else
+                api_media_id=$(printf "%s" "$choice" | cut -f6)
             fi
         fi
 
@@ -903,10 +956,10 @@ EOF
         section=$2
         if [ "$path" = "home" ]; then
             response=$(curl -s "https://${base}/${path}" | $sed -n "/id=\"${section}\"/,/class=\"block_area block_area_home section-id-02\"/p" | $sed ':a;N;$!ba;s/\n//g;s/class="flw-item"/\n/g' |
-                $sed -nE "s@.*img data-src=\"([^\"]*)\".*<a href=\".*/(tv|movie)/watch-.*-([0-9]*)\".*title=\"([^\"]*)\".*class=\"fdi-item\">([^<]*)</span>.*@\1\t\3\t\2\t\4 [\5]@p" | $hxunent)
+                $sed -nE "s@.*img data-src=\"([^\"]*)\".*<a href=\".*/((tv|movie)/watch-[^\"]*-([0-9]*))\".*title=\"([^\"]*)\".*class=\"fdi-item\">([^<]*)</span>.*@\1\t\4\t\3\t\5 [\6]\t\2@p" | $hxunent)
         else
             response=$(curl -s "https://${base}/${path}" | $sed ':a;N;$!ba;s/\n//g;s/class="flw-item"/\n/g' |
-                $sed -nE "s@.*img data-src=\"([^\"]*)\".*<a href=\".*/(tv|movie)/watch-.*-([0-9]*)\".*title=\"([^\"]*)\".*class=\"fdi-item\">([^<]*)</span>.*@\1\t\3\t\2\t\4 [\5]@p" | $hxunent)
+                $sed -nE "s@.*img data-src=\"([^\"]*)\".*<a href=\".*/((tv|movie)/watch-[^\"]*-([0-9]*))\".*title=\"([^\"]*)\".*class=\"fdi-item\">([^<]*)</span>.*@\1\t\4\t\3\t\5 [\6]\t\2@p" | $hxunent)
         fi
         main
     }
