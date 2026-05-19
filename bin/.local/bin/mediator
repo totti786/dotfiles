@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
 
 # Define cache and file paths
-data_dir="$HOME/.local/share/mediator"
-shortcuts="$HOME/.local/share/applications/media"
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp}"
+
+data_dir="$data_home/mediator"
+shortcuts="$data_home/applications/media"
 watchlater_dir="$data_dir/watch_later"
-media_history="$data_dir/media_history.txt"
-config_file="$data_dir/conf.sh"
+media_history="$state_home/mediator/media_history.txt"
+config_file="$config_home/mediator/conf.sh"
 fallback_poster="$data_dir/cover.jpg"
+episode_cache_dir="$cache_home/mediator/episode_lists"
+jellyfin_poster_cache_dir="$cache_home/mediator/jellyfin/posters"
+jellyfin_meta_cache_dir="$cache_home/mediator/jellyfin/meta"
 
 # Create necessary directories if they don't exist
+mkdir -p "$data_dir"
 mkdir -p "$shortcuts"
 mkdir -p "$watchlater_dir"
+mkdir -p "${config_file%/*}"
+mkdir -p "${media_history%/*}"
+mkdir -p "$episode_cache_dir"
+mkdir -p "$jellyfin_poster_cache_dir"
+mkdir -p "$jellyfin_meta_cache_dir"
 
 configuration(){
 	[[ -f "$config_file" ]] && . "${config_file}" || echo  "# mediator config file" >> "${config_file}"
@@ -19,7 +34,630 @@ configuration(){
 	[[ -z "$movies_directory" ]] && movies_directory="$HOME/Videos/Movies"
 	[[ -z "$shows_directory" ]] && shows_directory="$HOME/Videos/Shows"
 	[[ -z "$player" ]] && player="mpv"
-	[[ -z "$speed" ]] || [[ "$player" == "syncplay" ]] && speed="1.0"
+	[[ -z "$speed" ]] && speed="1.0"
+	[[ "$player" == "syncplay" ]] && speed="1.0"
+	[[ -z "$jellyfin_url" ]] && jellyfin_url=""
+	[[ -z "$jellyfin_api_key" ]] && jellyfin_api_key=""
+	[[ -z "$jellyfin_user_id" ]] && jellyfin_user_id=""
+	[[ -z "$jellyfin_username" ]] && jellyfin_username=""
+	[[ -z "$jellyfin_library_name" ]] && jellyfin_library_name="Anime"
+	[[ -z "$jellyfin_anime_library_name" ]] && jellyfin_anime_library_name="${jellyfin_library_name:-Anime}"
+	[[ -z "$jellyfin_shows_library_name" ]] && jellyfin_shows_library_name="Shows"
+	[[ -z "$jellyfin_movies_library_name" ]] && jellyfin_movies_library_name="Movies"
+	[[ -z "$jellyfin_cache_ttl" ]] && jellyfin_cache_ttl="300"
+	if [[ -n "$jellyfin_url" && ! "$jellyfin_url" =~ ^https?:// ]]; then
+		jellyfin_url="https://$jellyfin_url"
+	fi
+}
+
+check_dependencies() {
+	local required=(find awk sed grep sort curl)
+	local missing=()
+	local cmd
+
+	for cmd in "${required[@]}"; do
+		command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+	done
+
+	if [[ ${#missing[@]} -gt 0 ]]; then
+		printf "Error: Missing required command(s): %s\n" "${missing[*]}" >&2
+		exit 1
+	fi
+}
+
+require_jellyfin_deps() {
+	local required=(curl jq rofi mpv)
+	local missing=()
+	local cmd
+
+	for cmd in "${required[@]}"; do
+		command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+	done
+
+	if [[ ${#missing[@]} -gt 0 ]]; then
+		printf "Error: Missing Jellyfin command(s): %s\n" "${missing[*]}" >&2
+		return 1
+	fi
+}
+
+set_config_value() {
+	local key="$1"
+	local value="$2"
+	local escaped
+
+	escaped="$(printf '%s' "$value" | sed 's/[\/&]/\\&/g')"
+	if grep -qE "^${key}=" "$config_file"; then
+		sed -i "s|^${key}=.*|${key}=\"${escaped}\"|" "$config_file"
+	else
+		printf '%s="%s"\n' "$key" "$value" >> "$config_file"
+	fi
+}
+
+jellyfin_api() {
+	local endpoint="$1"
+	local url
+	local response
+	local body
+	local code
+
+	url="${jellyfin_url%/}${endpoint}"
+	response="$(curl -sS \
+		-H "X-Emby-Token: $jellyfin_api_key" \
+		-H "Accept: application/json" \
+		-w $'\n%{http_code}' \
+		"$url" 2>/dev/null)" || {
+		echo "Jellyfin request failed: $url" >&2
+		return 1
+	}
+
+	code="$(printf "%s\n" "$response" | tail -n1)"
+	body="$(printf "%s\n" "$response" | sed '$d')"
+
+	if [[ ! "$code" =~ ^2 ]]; then
+		echo "Jellyfin HTTP error ${code} for ${url}" >&2
+		printf "%s\n" "$body" | head -c 240 >&2
+		echo >&2
+		return 1
+	fi
+
+	if ! printf "%s\n" "$body" | jq -e . >/dev/null 2>&1; then
+		echo "Jellyfin returned non-JSON for ${url}" >&2
+		printf "%s\n" "$body" | head -c 240 >&2
+		echo >&2
+		echo "Tip: set jellyfin_url with full scheme, e.g. https://your-domain" >&2
+		return 1
+	fi
+
+	printf "%s\n" "$body"
+}
+
+jellyfin_api_cached() {
+	local endpoint="$1"
+	local ttl="${2:-$jellyfin_cache_ttl}"
+	local cache_key
+	local cache_file
+	local tmp_file
+	local now
+	local mtime
+	local age
+	local body
+
+	[[ -z "$ttl" || ! "$ttl" =~ ^[0-9]+$ ]] && ttl=300
+	if [[ "$ttl" -le 0 ]]; then
+		jellyfin_api "$endpoint"
+		return $?
+	fi
+
+	cache_key="$(printf '%s' "$endpoint" | cksum | awk '{print $1}')"
+	cache_file="$jellyfin_meta_cache_dir/${cache_key}.json"
+	now="$(date +%s)"
+
+	if [[ -s "$cache_file" ]]; then
+		mtime="$(stat -c %Y "$cache_file" 2>/dev/null || echo 0)"
+		age=$((now - mtime))
+		if [[ "$age" -le "$ttl" ]]; then
+			cat "$cache_file"
+			return 0
+		fi
+	fi
+
+	if body="$(jellyfin_api "$endpoint" 2>/dev/null)"; then
+		tmp_file="${cache_file}.tmp.$$"
+		printf "%s\n" "$body" > "$tmp_file"
+		mv "$tmp_file" "$cache_file"
+		printf "%s\n" "$body"
+		return 0
+	fi
+
+	# Fallback to stale cache when network/API fails.
+	[[ -s "$cache_file" ]] && { cat "$cache_file"; return 0; }
+	return 1
+}
+
+jellyfin_cache_primary_image() {
+	local item_id="$1"
+	local tag="$2"
+	local cache_key
+	local image_path
+	local image_url
+
+	[[ -z "$item_id" ]] && return 0
+	cache_key="${item_id}_${tag:-notag}"
+	cache_key="$(printf '%s' "$cache_key" | sed 's/[^A-Za-z0-9._-]/_/g')"
+	image_path="$jellyfin_poster_cache_dir/${cache_key}.jpg"
+	[[ -s "$image_path" ]] && { printf "%s\n" "$image_path"; return 0; }
+
+	image_url="${jellyfin_url%/}/Items/${item_id}/Images/Primary?maxWidth=220&maxHeight=330&quality=90"
+	[[ -n "$tag" ]] && image_url="${image_url}&tag=${tag}"
+
+	if curl -fsS -H "X-Emby-Token: $jellyfin_api_key" -o "${image_path}.tmp" "$image_url" 2>/dev/null; then
+		mv "${image_path}.tmp" "$image_path"
+		printf "%s\n" "$image_path"
+	else
+		rm -f "${image_path}.tmp"
+	fi
+}
+
+jellyfin_get_user_id() {
+	local users_json
+	if [[ -n "$jellyfin_user_id" ]]; then
+		return 0
+	fi
+
+	users_json="$(jellyfin_api_cached "/Users" "$jellyfin_cache_ttl" 2>/dev/null)" || return 1
+	if [[ -n "$jellyfin_username" ]]; then
+		jellyfin_user_id="$(echo "$users_json" | jq -r --arg u "$jellyfin_username" '.[] | select(.Name == $u) | .Id' | head -n1)"
+	fi
+	[[ -z "$jellyfin_user_id" ]] && jellyfin_user_id="$(echo "$users_json" | jq -r '.[0].Id // empty')"
+	[[ -n "$jellyfin_user_id" ]]
+}
+
+jellyfin_pick_library_id() {
+	local preferred_name="$1"
+	local views_json
+	local library_id
+	local selection_idx
+	local -a library_names
+	local -a library_ids
+	views_json="$(jellyfin_api_cached "/Users/${jellyfin_user_id}/Views" "$jellyfin_cache_ttl" 2>/dev/null)" || return 1
+
+	library_id="$(echo "$views_json" | jq -r --arg n "$preferred_name" '.Items[] | select(.Name == $n) | .Id' | head -n1)"
+	if [[ -n "$library_id" ]]; then
+		printf "%s\n" "$library_id"
+		return 0
+	fi
+
+	mapfile -t library_names < <(echo "$views_json" | jq -r '.Items[] | .Name')
+	mapfile -t library_ids < <(echo "$views_json" | jq -r '.Items[] | .Id')
+	[[ "${#library_ids[@]}" -eq 0 ]] && return 1
+	selection_idx="$(prompt_menu_index "$(printf "%s\n" "${library_names[@]}")" "Select Jellyfin library:")"
+	[[ -z "$selection_idx" ]] && return 1
+	printf "%s\n" "${library_ids[$selection_idx]}"
+}
+
+jellyfin_play_item() {
+	local item_json="$1"
+	local show_action_menu="${2:-1}"
+	local item_id
+	local item_name
+	local ticks
+	local start_seconds
+	local stream_url
+	local action
+	local ipc_socket
+	local mpv_pid
+	local poll_delay=2
+	local last_pos=0
+	local duration=0
+	local pos_raw
+	local dur_raw
+	local position_ticks
+	local duration_ticks
+	local played=false
+	local progress=0
+	local playback_pid
+	local playback_mode
+
+	item_id="$(echo "$item_json" | jq -r '.Id')"
+	# Always refresh selected item so resume position is accurate even if list data is cached.
+	item_json="$(jellyfin_api "/Users/${jellyfin_user_id}/Items/${item_id}" 2>/dev/null || printf "%s\n" "$item_json")"
+	item_name="$(echo "$item_json" | jq -r '.Name // "Jellyfin Item"')"
+	ticks="$(echo "$item_json" | jq -r '.UserData.PlaybackPositionTicks // 0')"
+	start_seconds=$((ticks / 10000000))
+	stream_url="${jellyfin_url%/}/Videos/${item_id}/stream?Static=true&api_key=${jellyfin_api_key}"
+
+	while true; do
+		last_pos="$start_seconds"
+		duration=0
+		progress=0
+		played=false
+		playback_mode="mpv"
+
+		ipc_socket="$runtime_dir/mediator-jellyfin-${item_id}-$$.sock"
+		rm -f "$ipc_socket"
+
+		if [[ "$player" == "syncplay" ]]; then
+			if ! command -v syncplay >/dev/null 2>&1; then
+				echo "Error: syncplay is not installed." >&2
+				return 1
+			fi
+			playback_mode="syncplay"
+			syncplay --player-path "$(command -v mpv)" "$stream_url" -- \
+				--title="$item_name" \
+				--start="$start_seconds" \
+				--input-ipc-server="$ipc_socket" >/dev/null 2>&1 &
+			playback_pid=$!
+		else
+			mpv --speed="$speed" --title="$item_name" --start="$start_seconds" --input-ipc-server="$ipc_socket" "$stream_url" >/dev/null 2>&1 &
+			playback_pid=$!
+		fi
+
+		if command -v socat >/dev/null 2>&1; then
+			while kill -0 "$playback_pid" 2>/dev/null; do
+				pos_raw="$(printf '{"command":["get_property","time-pos"]}\n' | socat - "$ipc_socket" 2>/dev/null | jq -r '.data // empty' 2>/dev/null)"
+				dur_raw="$(printf '{"command":["get_property","duration"]}\n' | socat - "$ipc_socket" 2>/dev/null | jq -r '.data // empty' 2>/dev/null)"
+				[[ "$pos_raw" =~ ^[0-9]+([.][0-9]+)?$ ]] && last_pos="${pos_raw%.*}"
+				[[ "$dur_raw" =~ ^[0-9]+([.][0-9]+)?$ ]] && duration="${dur_raw%.*}"
+				sleep "$poll_delay"
+			done
+		fi
+
+		wait "$playback_pid"
+		rm -f "$ipc_socket"
+
+		[[ "$last_pos" -lt 0 ]] && last_pos=0
+		position_ticks=$((last_pos * 10000000))
+		duration_ticks=$((duration * 10000000))
+		if [[ "$duration" -gt 0 ]]; then
+			progress=$((last_pos * 100 / duration))
+			[[ "$progress" -ge 90 ]] && played=true
+		fi
+		jellyfin_update_user_progress "$item_id" "$position_ticks" "$duration_ticks" "$played" >/dev/null 2>&1
+
+		[[ "$show_action_menu" != "1" ]] && return 0
+
+		action="$(prompt_menu "Resume\nReplay\nExit" "Jellyfin: ${item_name}")"
+		case "$action" in
+			"Replay")
+				start_seconds=0
+				;;
+			"Resume")
+				start_seconds="$last_pos"
+				;;
+			*)
+				return 10
+				;;
+		esac
+	done
+}
+
+jellyfin_update_user_progress() {
+	local item_id="$1"
+	local position_ticks="$2"
+	local duration_ticks="$3"
+	local played="$4"
+	local payload
+
+	[[ -z "$item_id" || -z "$jellyfin_user_id" ]] && return 0
+	[[ -z "$position_ticks" ]] && position_ticks=0
+	[[ -z "$duration_ticks" ]] && duration_ticks=0
+	[[ "$played" != "true" ]] && played="false"
+
+	payload="$(jq -n \
+		--argjson position "$position_ticks" \
+		--argjson runtime "$duration_ticks" \
+		--argjson played "$played" \
+		'{PlaybackPositionTicks:$position, Played:$played, PlayedPercentage:(if $runtime>0 then (($position*100)/$runtime) else 0 end)}')"
+
+	curl -fsS -X POST \
+		-H "X-Emby-Token: $jellyfin_api_key" \
+		-H "Content-Type: application/json" \
+		-d "$payload" \
+		"${jellyfin_url%/}/Users/${jellyfin_user_id}/Items/${item_id}/UserData" >/dev/null 2>&1 || true
+
+	if [[ "$played" == "true" ]]; then
+		curl -fsS -X POST \
+			-H "X-Emby-Token: $jellyfin_api_key" \
+			"${jellyfin_url%/}/Users/${jellyfin_user_id}/PlayedItems/${item_id}" >/dev/null 2>&1 || true
+	fi
+}
+
+jellyfin_format_episode_label() {
+	local num="$1"
+	local name="$2"
+	local series="$3"
+	local clean_title
+	local lower_title
+	local lower_series
+
+	clean_title="$(printf "%s" "$name" | sed -E \
+		-e 's/\[[^]]*\]//g' \
+		-e 's/\([^)]*\)//g' \
+		-e 's/[._]+/ /g' \
+		-e 's/^[[:space:]-]+//' \
+		-e 's/[[:space:]-]+$//' \
+		-e 's/[[:space:]]+/ /g')"
+
+	# Strip repeated series name prefix when Jellyfin title contains it.
+	lower_title="${clean_title,,}"
+	lower_series="${series,,}"
+	if [[ -n "$series" && "$lower_title" == "$lower_series"* ]]; then
+		clean_title="${clean_title:${#series}}"
+		clean_title="$(printf "%s" "$clean_title" | sed -E \
+			-e 's/^[[:space:]:-]+//' \
+			-e 's/[[:space:]]+/ /g' \
+			-e 's/[[:space:]-]+$//')"
+	fi
+
+	# Strip generic "Episode N" or "Ep N" prefixes from title body.
+	if [[ -n "$num" ]]; then
+		clean_title="$(printf "%s" "$clean_title" | sed -E \
+			-e "s/^[Ee]pisode[[:space:]]*${num}([[:space:]:-]+|$)//" \
+			-e "s/^[Ee]p[[:space:]]*${num}([[:space:]:-]+|$)//" \
+			-e 's/^[[:space:]:-]+//' \
+			-e 's/[[:space:]-]+$//')"
+	fi
+
+	if [[ -n "$num" ]]; then
+		if [[ -n "$clean_title" ]]; then
+			printf "Episode %s - %s\n" "$num" "$clean_title"
+		else
+			printf "Episode %s\n" "$num"
+		fi
+	elif [[ -n "$clean_title" ]]; then
+		printf "%s\n" "$clean_title"
+	else
+		printf "Unknown Episode\n"
+	fi
+}
+
+jellyfin_browse_series_library() {
+	local preferred_library_name="$1"
+	local kind_label="$2"
+	local library_id
+	local series_json
+	local seasons_json
+	local episodes_json
+	local selection_idx
+	local series_id
+	local season_id
+	local season_count
+	local episode_json
+	local episode_label
+	local episode_num
+	local series_name
+	local season_name
+	local series_icon
+	local season_icon
+	local episode_icon
+	local image_tag
+	local series_fallback_id
+	local series_fallback_tag
+	local item_id
+	local item_name
+	local safe_name
+	local -a series_labels
+	local -a series_ids
+	local -a series_menu_rows
+	local -a season_labels
+	local -a season_ids
+	local -a season_menu_rows
+	local -a episode_labels
+	local -a episode_items
+
+	require_jellyfin_deps || return 1
+	[[ -z "$jellyfin_url" || -z "$jellyfin_api_key" ]] && echo "Set jellyfin_url and jellyfin_api_key in $config_file" >&2 && return 1
+
+	jellyfin_get_user_id || { echo "Could not resolve Jellyfin user id. Set jellyfin_user_id or jellyfin_username." >&2; return 1; }
+	library_id="$(jellyfin_pick_library_id "$preferred_library_name")" || return 1
+
+	series_json="$(jellyfin_api_cached "/Users/${jellyfin_user_id}/Items?ParentId=${library_id}&IncludeItemTypes=Series&Recursive=true&SortBy=SortName&Fields=SortName,ImageTags" "$jellyfin_cache_ttl" 2>/dev/null)" || return 1
+	mapfile -t series_labels < <(echo "$series_json" | jq -r '.Items[] | .Name')
+	mapfile -t series_ids < <(echo "$series_json" | jq -r '.Items[] | .Id')
+	[[ "${#series_ids[@]}" -eq 0 ]] && return 0
+
+	series_menu_rows=()
+	while IFS= read -r episode_json; do
+		item_name="$(echo "$episode_json" | jq -r '.Name // ""')"
+		item_id="$(echo "$episode_json" | jq -r '.Id // empty')"
+		image_tag="$(echo "$episode_json" | jq -r '.ImageTags.Primary // empty')"
+		series_icon="$(jellyfin_cache_primary_image "$item_id" "$image_tag")"
+		safe_name="${item_name//$'\t'/ }"
+		series_menu_rows+=("${safe_name}"$'\t'"${series_icon}")
+	done < <(echo "$series_json" | jq -c '.Items[]')
+
+	while true; do
+		selection_idx="$(prompt_menu_index_with_icons "$(printf "%s\n" "${series_menu_rows[@]}")" "Select ${kind_label} series:")"
+		[[ -z "$selection_idx" ]] && return 0
+		series_id="${series_ids[$selection_idx]}"
+		series_name="${series_labels[$selection_idx]}"
+
+		while true; do
+			seasons_json="$(jellyfin_api_cached "/Users/${jellyfin_user_id}/Items?ParentId=${series_id}&IncludeItemTypes=Season&SortBy=SortName&Fields=ImageTags" "$jellyfin_cache_ttl" 2>/dev/null)" || return 1
+			season_count="$(echo "$seasons_json" | jq '.Items | length')"
+			season_id=""
+			if [[ "$season_count" -gt 1 ]]; then
+				mapfile -t season_labels < <(echo "$seasons_json" | jq -r '.Items[] | .Name')
+				mapfile -t season_ids < <(echo "$seasons_json" | jq -r '.Items[] | .Id')
+
+				image_tag="$(echo "$series_json" | jq -r --arg id "$series_id" '.Items[] | select(.Id == $id) | .ImageTags.Primary // empty' | head -n1)"
+				series_icon="$(jellyfin_cache_primary_image "$series_id" "$image_tag")"
+				season_menu_rows=()
+				while IFS= read -r episode_json; do
+					season_name="$(echo "$episode_json" | jq -r '.Name // ""')"
+					item_id="$(echo "$episode_json" | jq -r '.Id // empty')"
+					image_tag="$(echo "$episode_json" | jq -r '.ImageTags.Primary // empty')"
+					season_icon="$(jellyfin_cache_primary_image "$item_id" "$image_tag")"
+					[[ -z "$season_icon" ]] && season_icon="$series_icon"
+					safe_name="${season_name//$'\t'/ }"
+					season_menu_rows+=("${safe_name}"$'\t'"${season_icon}")
+				done < <(echo "$seasons_json" | jq -c '.Items[]')
+
+				selection_idx="$(prompt_menu_index_with_icons "$(printf "%s\n" "${season_menu_rows[@]}")" "Select season: ${series_name}")"
+				[[ -z "$selection_idx" ]] && break
+				season_id="${season_ids[$selection_idx]}"
+			else
+				season_id="$(echo "$seasons_json" | jq -r '.Items[0].Id // empty')"
+			fi
+
+			if [[ -n "$season_id" ]]; then
+				episodes_json="$(jellyfin_api_cached "/Users/${jellyfin_user_id}/Items?ParentId=${season_id}&IncludeItemTypes=Episode&SortBy=SortName&Fields=IndexNumber,Name,UserData,ImageTags,SeriesId,SeriesPrimaryImageTag" "$jellyfin_cache_ttl" 2>/dev/null)" || return 1
+			else
+				episodes_json="$(jellyfin_api_cached "/Users/${jellyfin_user_id}/Items?ParentId=${series_id}&IncludeItemTypes=Episode&SortBy=SortName&Fields=IndexNumber,Name,UserData,ImageTags,SeriesId,SeriesPrimaryImageTag" "$jellyfin_cache_ttl" 2>/dev/null)" || return 1
+			fi
+
+			mapfile -t episode_items < <(echo "$episodes_json" | jq -c '.Items[]')
+			[[ "${#episode_items[@]}" -eq 0 ]] && break
+
+			while true; do
+				episode_labels=()
+				for episode_json in "${episode_items[@]}"; do
+					episode_num="$(echo "$episode_json" | jq -r '.IndexNumber // empty')"
+					episode_label="$(echo "$episode_json" | jq -r '.Name // ""')"
+					episode_label="$(jellyfin_format_episode_label "$episode_num" "$episode_label" "$series_name")"
+					episode_labels+=("$episode_label")
+				done
+
+				selection_idx="$(prompt_menu_index "$(printf "%s\n" "${episode_labels[@]}")" "Select the episode:")"
+				[[ -z "$selection_idx" ]] && break
+				episode_json="${episode_items[$selection_idx]}"
+				jellyfin_play_item "$episode_json" 0
+				# Refresh user progress before showing menu again.
+				if [[ -n "$season_id" ]]; then
+					episodes_json="$(jellyfin_api "/Users/${jellyfin_user_id}/Items?ParentId=${season_id}&IncludeItemTypes=Episode&SortBy=SortName&Fields=IndexNumber,Name,UserData,ImageTags,SeriesId,SeriesPrimaryImageTag" 2>/dev/null)" || return 1
+				else
+					episodes_json="$(jellyfin_api "/Users/${jellyfin_user_id}/Items?ParentId=${series_id}&IncludeItemTypes=Episode&SortBy=SortName&Fields=IndexNumber,Name,UserData,ImageTags,SeriesId,SeriesPrimaryImageTag" 2>/dev/null)" || return 1
+				fi
+				mapfile -t episode_items < <(echo "$episodes_json" | jq -c '.Items[]')
+				[[ "${#episode_items[@]}" -eq 0 ]] && break
+			done
+
+			if [[ "$season_count" -gt 1 ]]; then
+				continue
+			fi
+			break
+		done
+	done
+}
+
+jellyfin_anime() {
+	jellyfin_browse_series_library "$jellyfin_anime_library_name" "anime"
+}
+
+jellyfin_shows() {
+	jellyfin_browse_series_library "$jellyfin_shows_library_name" "show"
+}
+
+jellyfin_movies() {
+	local library_id
+	local movies_json
+	local selection_idx
+	local movie_json
+	local movie_label
+	local movie_icon
+	local image_tag
+	local item_id
+	local safe_name
+	local -a movie_labels
+	local -a movie_items
+	local -a movie_menu_rows
+
+	require_jellyfin_deps || return 1
+	[[ -z "$jellyfin_url" || -z "$jellyfin_api_key" ]] && echo "Set jellyfin_url and jellyfin_api_key in $config_file" >&2 && return 1
+
+	jellyfin_get_user_id || { echo "Could not resolve Jellyfin user id. Set jellyfin_user_id or jellyfin_username." >&2; return 1; }
+	library_id="$(jellyfin_pick_library_id "$jellyfin_movies_library_name")" || return 1
+
+	movies_json="$(jellyfin_api_cached "/Users/${jellyfin_user_id}/Items?ParentId=${library_id}&IncludeItemTypes=Movie&Recursive=true&SortBy=SortName&Fields=Name,ProductionYear,UserData,ImageTags" "$jellyfin_cache_ttl" 2>/dev/null)" || return 1
+	mapfile -t movie_items < <(echo "$movies_json" | jq -c '.Items[]')
+	[[ "${#movie_items[@]}" -eq 0 ]] && return 0
+	movie_labels=()
+	movie_menu_rows=()
+	for movie_json in "${movie_items[@]}"; do
+		movie_label="$(echo "$movie_json" | jq -r '.Name + (if .ProductionYear then " (" + (.ProductionYear|tostring) + ")" else "" end)')"
+		movie_labels+=("$movie_label")
+		item_id="$(echo "$movie_json" | jq -r '.Id // empty')"
+		image_tag="$(echo "$movie_json" | jq -r '.ImageTags.Primary // empty')"
+		movie_icon="$(jellyfin_cache_primary_image "$item_id" "$image_tag")"
+		safe_name="${movie_label//$'\t'/ }"
+		movie_menu_rows+=("${safe_name}"$'\t'"${movie_icon}")
+	done
+	selection_idx="$(prompt_menu_index_with_icons "$(printf "%s\n" "${movie_menu_rows[@]}")" "Select movie:")"
+	[[ -z "$selection_idx" ]] && return 0
+	movie_json="${movie_items[$selection_idx]}"
+	jellyfin_play_item "$movie_json" 0
+}
+
+jellyfin_login() {
+	local in_url
+	local in_key
+	local in_user
+	local in_anime
+	local in_shows
+	local in_movies
+
+	printf "Jellyfin server URL (e.g. http://localhost:8096): "
+	read -r in_url
+	printf "Jellyfin API key: "
+	read -r in_key
+	printf "Jellyfin username (optional): "
+	read -r in_user
+	printf "Anime library name [Anime]: "
+	read -r in_anime
+	printf "Shows library name [Shows]: "
+	read -r in_shows
+	printf "Movies library name [Movies]: "
+	read -r in_movies
+
+	[[ -z "$in_anime" ]] && in_anime="Anime"
+	[[ -z "$in_shows" ]] && in_shows="Shows"
+	[[ -z "$in_movies" ]] && in_movies="Movies"
+	[[ -n "$in_url" ]] && set_config_value "jellyfin_url" "$in_url"
+	[[ -n "$in_key" ]] && set_config_value "jellyfin_api_key" "$in_key"
+	set_config_value "jellyfin_username" "$in_user"
+	set_config_value "jellyfin_library_name" "$in_anime"
+	set_config_value "jellyfin_anime_library_name" "$in_anime"
+	set_config_value "jellyfin_shows_library_name" "$in_shows"
+	set_config_value "jellyfin_movies_library_name" "$in_movies"
+	set_config_value "jellyfin_user_id" ""
+
+	echo "Jellyfin config saved to $config_file"
+}
+
+get_episode_list_for_dir() {
+	local dir="$1"
+	local cache_key
+	local cache_file
+	local tmp_file
+	local dir_mtime
+	local cached_mtime
+	local cached_dir
+	local list
+
+	[[ -z "$dir" || ! -d "$dir" ]] && return 0
+
+	dir_mtime="$(stat -c %Y "$dir" 2>/dev/null || echo 0)"
+	cache_key="$(printf '%s' "$dir" | cksum | awk '{print $1}')"
+	cache_file="$episode_cache_dir/${cache_key}.lst"
+
+	if [[ -f "$cache_file" ]]; then
+		cached_mtime="$(sed -n '1s/^#mtime=//p' "$cache_file")"
+		cached_dir="$(sed -n '2s/^#dir=//p' "$cache_file")"
+		if [[ "$cached_mtime" == "$dir_mtime" && "$cached_dir" == "$dir" ]]; then
+			sed -n '3,$p' "$cache_file"
+			return 0
+		fi
+	fi
+
+	list="$(find -L "$dir" -maxdepth 1 -type f -iregex '.*\.\(mp4\|mkv\)' | sort -V)"
+	tmp_file="${cache_file}.tmp.$$"
+	{
+		printf "#mtime=%s\n" "$dir_mtime"
+		printf "#dir=%s\n" "$dir"
+		printf "%s\n" "$list"
+	} > "$tmp_file"
+	mv "$tmp_file" "$cache_file"
+	printf "%s\n" "$list"
 }
 
 # Check if the fallback poster exists; if not, create it
@@ -91,6 +729,7 @@ get_poster(){
 
 process_media(){
 	media_type="$1"
+	[[ "$player" == "syncplay" ]] && exec_command="$0 -s --episode" || exec_command="$0 --episode"
 	case "$media_type" in
 		"movies")
 			media_directory="$movies_directory"
@@ -98,11 +737,18 @@ process_media(){
 			readarray -t lines < <(find -L "$media_directory" -type f -iregex '.*\.\(mp4\|mkv\)' | sort)
 			;;
 		"shows" | "anime")
-			[[ "$player" == "syncplay" ]] && exec_command="$0 -s --episode" || exec_command="$0 --episode"
 			media_directory="$([ "$media_type" = "shows" ] && echo "$shows_directory" || echo "$anime_directory")"
-			# Find directories containing media files
-			readarray -t lines < <(find "$media_directory" -mindepth 1 -maxdepth 1 -print0 | while IFS= read -r -d '' dir; do
-				if find -L "$dir" -type f -iregex '.*\.\(mp4\|mkv\)' -print -quit | grep -q .; then echo "$dir" ;fi done | sort)
+			# Find directories containing media files, AND loose media files in root
+			readarray -t lines < <(
+				{
+					# Directories with media files
+					find "$media_directory" -mindepth 1 -maxdepth 1 -type d -print0 | while IFS= read -r -d '' dir; do
+						if find -L "$dir" -type f -iregex '.*\.\(mp4\|mkv\)' -print -quit | grep -q .; then echo "$dir"; fi
+					done
+					# Loose media files directly in the root directory
+					find -L "$media_directory" -maxdepth 1 -type f -iregex '.*\.\(mp4\|mkv\)'
+				} | sort
+			)
 			;;
 		*)
 			echo "Invalid media type specified."
@@ -113,7 +759,9 @@ process_media(){
 	saved_lines="$data_dir/$media_type/$media_type.txt"
 
 	# Define the titles array
-	IFS=$'\n' posters=($(find "$data_dir"/"$media_type" -type f -iname "*.jpg" 2> /dev/null))
+	mapfile -t posters < <(find "$data_dir"/"$media_type" -type f -iname "*.jpg" 2> /dev/null)
+	used_images=()
+	used_lines=()
 
 	if [[ ${#lines[@]} -eq 0 ]]; then
 		notify-send -r 12 -u low -a mediator "mediator" "No files were found in $media_directory"
@@ -122,8 +770,9 @@ process_media(){
 		notify-send -r 12 -u low -a mediator "mediator" "Updating List..."
 	fi
 
-	# Declare an associative array
+	# Declare associative maps for quick lookups.
 	declare -A title_map
+	declare -A line_map
 
 	# Read the file line-by-line
 	if [[ -f "$saved_lines" ]]; then
@@ -131,6 +780,7 @@ process_media(){
 			# Check if the line contains both a path and a title
 			if [[ -n "$path" && -n "$title" ]]; then
 				title_map["$path"]="$title"
+				line_map["$path"]="$path"$'\t'"$title"
 			fi
 		done < "$saved_lines"
 	fi
@@ -160,8 +810,9 @@ process_media(){
 						-e 's/{[^}]*}//g' -e 's/[._()]/ /g' -e 's/[[:space:]]\+/ /g; s/^[ \t]*//; s/[ \t]*$//' \
 						-e 's/[[:space:]]\([Ss][Ee][Aa][Ss][Oo][Nn] [[:digit:]]\{1,2\}\|[Ss][0-9]\{1,2\}\(-[0-9]\{1,2\}\)\?\|[Ss][0-9]\{1,2\}[Ee][0-9]\{1,2\}\)[[:space:]]\{0,\}.*$//')
 				year=""
-			fi
-			printf "%s\t%s\n" "$line" "$title" >> "$saved_lines" 2> /dev/null
+				fi
+				printf "%s\t%s\n" "$line" "$title" >> "$saved_lines" 2> /dev/null
+				line_map["$line"]="$line"$'\t'"$title"
 		fi
 
 		# Check if the poster file is missing and download it
@@ -174,25 +825,30 @@ process_media(){
 		# Set the clean version of the title in the player
 		if [[ "$media_type" == "movies" ]]; then
 			if [[ "$player" == "syncplay" ]]; then
-				exec_command="syncplay --player-path $(command -v mpv) \"$line\""
-				#exec_command+=" --force-media-title=\"$title\" --title=\"$title\" \"$line\""
+				exec_command="$0 -s --episode"
 			else
 				exec_command="mpv --speed=$speed --write-filename-in-watch-later-config --save-position-on-quit"
 				exec_command+=" --force-media-title=\"$title\" --title=\"$title\" \"$line\""
 			fi
 		fi
-
 		# Create a list of used posters
 		used_images+=("$data_dir/$media_type/$title")
-		used_lines+=($(grep -F "${line}" "$saved_lines" | head -n1 ))
+		matched_line="${line_map[$line]}"
+		[[ -n "$matched_line" ]] && used_lines+=("$matched_line")
 
 		menu_entry="$shortcuts/$title.desktop"
+
+		if [[ "$media_type" == "shows" || "$media_type" == "anime" || ( "$media_type" == "movies" && "$player" == "syncplay" ) ]]; then
+			desktop_exec="$exec_command \"$media_type\" \"$title\" \"$line\""
+		else
+			desktop_exec="$exec_command \"$media_type\" \"$title\""
+		fi
 
 		if [[ ! -f "$menu_entry" ]]; then
 			cat > "$menu_entry" <<- EOF
 			[Desktop Entry]
 			Name=$title
-			Exec=$exec_command $media_type "$title"
+			Exec=$desktop_exec
 			Icon=$data_dir/$media_type/$title.jpg
 			Type=Application
 			Categories=${media_type^}
@@ -203,8 +859,8 @@ process_media(){
 	printf "%s\n" "${used_lines[@]}" > "$saved_lines"
 
 	# Delete unused posters
-	for cached_image in ${posters[@]} ; do
-	    if [[ ! " ${used_images[@]} " =~ "${cached_image%.jpg}" ]]; then
+	for cached_image in "${posters[@]}" ; do
+	    if [[ ! " ${used_images[*]} " =~ ${cached_image%.jpg} ]]; then
 			rm "$cached_image"
 		fi
 	done
@@ -232,7 +888,48 @@ prompt_menu() {
 		#textbox { padding: 24px; }"
 }
 
+prompt_menu_index() {
+	# Check if rofi is installed
+	if ! command -v rofi &> /dev/null; then
+		echo "Error: rofi is not installed." >&2
+		return 1
+	fi
+
+	# Check if options are provided
+	if [[ -z "$1" ]]; then
+		echo "Error: No options provided to display in the menu." >&2
+		return 1
+	fi
+
+	# Use the same mediator theme.
+	echo -e "$1" | rofi -sort -dmenu -mesg "$2" -format i -theme mediator 2>/dev/null
+}
+
+prompt_menu_index_with_icons() {
+	# Options format: "label<TAB>/path/to/icon" per line
+	if ! command -v rofi &> /dev/null; then
+		echo "Error: rofi is not installed." >&2
+		return 1
+	fi
+	if [[ -z "$1" ]]; then
+		echo "Error: No options provided to display in the menu." >&2
+		return 1
+	fi
+
+	while IFS=$'\t' read -r label icon; do
+		if [[ -n "$icon" && -f "$icon" ]]; then
+			printf '%s\0icon\x1f%s\n' "$label" "$icon"
+		else
+			printf '%s\n' "$label"
+		fi
+	done <<< "$1" | rofi -sort -dmenu -mesg "$2" -format i -theme mediator -show-icons -normal-window 2>/dev/null
+}
+
 get_duration() {
+	if ! command -v socat >/dev/null 2>&1; then
+		return 1
+	fi
+
 	# Wait until the duration is retrieved from mpv
 	while true; do
 		# Check if mpv is running
@@ -267,7 +964,8 @@ play_media() {
 	# Playlist file path
 	local playlist="$watchlater_dir/episode_list.m3u"
 	# IPC socket for MPV
-	local ipc_socket="/tmp/mpvsocket"
+	local ipc_socket="$runtime_dir/mpvsocket"
+	local episodes_for_playback
 
 	# Remove leading '/' if present
 	#[[ "${file_path:0:1}" == '/' ]] && file_path="${file_path#/}"
@@ -298,7 +996,9 @@ play_media() {
 		#player_cmd+=(--sub-auto=all --sub-file-paths="${subs_directory}/${file_name}")
 	#fi
 
-	get_episodes
+	# Always build a local episode list from the target file directory.
+	# This prevents stale season state from producing an empty playlist.
+	episodes_for_playback="$(find -L "${file_path%/*}" -maxdepth 1 -type f -iregex '.*\.\(mp4\|mkv\)' | sort -V)"
 	
 	# Handle playback with different players
 	case "$player" in
@@ -309,7 +1009,7 @@ play_media() {
 			;;
 		"mpv")
 			# Generate the playlist for mpv
-			echo "$episodes" | awk -v start="$file_path" 'BEGIN{found=0} {if ($0 == start) found=1} found' > "$playlist"
+			echo "$episodes_for_playback" | awk -v start="$file_path" 'BEGIN{found=0} {if ($0 == start) found=1} found' > "$playlist"
 			mpv "${player_cmd[@]}" "$playlist" >/dev/null 2>&1
 			;;
 		*)
@@ -323,54 +1023,224 @@ play_media() {
 }
 
 save_history() {
-	# Extract the base name from the file path
-	
-	local base_name="${1##*/}"
-	local title_name="${base_name%.*}"  # Remove the file extension for title
-	local title="$(grep -F "$title_name" "$saved_lines" | head -n1 | cut -f2 | uniq)"
-	
-	if [[ "$(printf "%s" "$1" -ne 1)" ]]; then 
-		title_name="$title"
-	fi
-	
-	# Get the duration of the video from the watchlater directory
-	local duration="$(cat "$watchlater_dir/duration" 2> /dev/null)"
-	
-	# Find the file associated with the current session using the 'start' information
-	local file="$(grep -hB1 "start=" "$watchlater_dir"/* 2>/dev/null | grep -FA2 "$title_name")"
+	local played_path="$1"
+	local duration
+	local watch_file
+	local candidate_file
+	local candidate_resolved
+	local candidate_path
+	local candidate_mtime
+	local candidate_start
+	local best_mtime=-1
+	local best_start=-1
+	local redirect_id
+	local redirect_file
+	local resolve_guard
+	local file_path
+	local position
+	local progress
+	local title
+	local show_path
+	local fallback_title
 
-	if [[ -n "$file" ]]; then
-		# Extract the playback position and file path from the retrieved data
-		local position="$(echo "$file" | awk -F= '/start/ {print int($2)}' | tail -n1)"
-		local file_path="$(echo "$file" | awk -F' start=' '/^# / {print substr($1, 3)}' | sort | tail -n1)"
+	# Fallback title if exact path lookup isn't found.
+	fallback_title="${played_path##*/}"
+	fallback_title="${fallback_title%.*}"
 
-		# Calculate progress if duration is available
-		progress=0
-		if [[ -n "$duration" ]]; then
-			progress=$(($position * 100 / $duration))
+	duration="$(cat "$watchlater_dir/duration" 2> /dev/null)"
+
+	# For loose files, also check parent directory matches since saved_lines may contain
+	# file paths but we need the directory for proper scoping.
+	local played_dir="${played_path%/*}"
+	show_path="$(awk -F'\t' -v p="$played_path" -v d="$played_dir" '
+		$1 == p { print $1; found=1; exit }
+		index(p, $1 "/") == 1 {
+			l = length($1)
+			if (l > best_len) {
+				best_len = l
+				best_path = $1
+			}
+		}
+		# Also match if the played file is under the saved directory path (for loose files)
+		index($1, d "/") == 1 {
+			l = length($1)
+			if (l > best_len) {
+				best_len = l
+				best_path = d
+			}
+		}
+		END {
+			if (!found && best_path != "") print best_path
+		}
+	' "$saved_lines")"
+	# Fallback to parent directory if no match found (handles loose files)
+	[[ -z "$show_path" && -f "$played_path" ]] && show_path="$played_dir"
+
+	# Pick the latest real media state for this show path, not just the launch path.
+	for candidate_file in "$watchlater_dir"/*; do
+		[[ ! -f "$candidate_file" ]] && continue
+		[[ "${candidate_file##*/}" == "duration" ]] && continue
+
+		candidate_resolved="$candidate_file"
+		resolve_guard=0
+		while [[ "$resolve_guard" -lt 6 ]]; do
+			redirect_id="$(awk -F= '/^redirect=/{print $2; exit}' "$candidate_resolved")"
+			[[ -z "$redirect_id" ]] && break
+			redirect_file="$watchlater_dir/$redirect_id"
+			[[ ! -f "$redirect_file" ]] && break
+			candidate_resolved="$redirect_file"
+			resolve_guard=$((resolve_guard + 1))
+		done
+
+		candidate_path="$(awk '/^# \// {sub(/^# /, "", $0); sub(/ start=.*/, "", $0); print; exit}' "$candidate_resolved")"
+		[[ -z "$candidate_path" ]] && continue
+
+		if [[ -n "$show_path" ]]; then
+			[[ "$candidate_path" == "$show_path" || "$candidate_path" == "$show_path/"* ]] || continue
 		fi
 
-		# Remove any existing history for the same title
-		if grep -qw "$title" "$media_history"; then
-			sed -i "/$title/d" "$media_history"
+		candidate_mtime="$(stat -c %Y "$candidate_resolved" 2>/dev/null || echo 0)"
+		candidate_start="$(awk -F= '/^start=/{print int($2); found=1} END{if (!found) print 0}' "$candidate_resolved")"
+
+		if (( candidate_mtime > best_mtime || (candidate_mtime == best_mtime && candidate_start > best_start) )); then
+			best_mtime="$candidate_mtime"
+			best_start="$candidate_start"
+			watch_file="$candidate_resolved"
+		fi
+	done
+
+	# Fallback when no show-scoped entry is found.
+	if [[ -z "$watch_file" ]]; then
+		watch_file="$(find "$watchlater_dir" -maxdepth 1 -type f ! -name "duration" -printf '%T@ %p\n' 2>/dev/null | sort -nr | awk 'NR==1 {print $2}')"
+	fi
+
+	if [[ -z "$watch_file" || ! -f "$watch_file" ]]; then
+		echo "History File Not Found!"
+		rm -f "$watchlater_dir"/*
+		return
+	fi
+
+	file_path="$(awk '/^# \// {sub(/^# /, "", $0); sub(/ start=.*/, "", $0); print; exit}' "$watch_file")"
+	[[ -z "$file_path" && -n "$played_path" ]] && file_path="$played_path"
+
+	position="$(awk -F= '/^start=/{print int($2); found=1} END{if (!found) print 0}' "$watch_file")"
+
+	title="$(awk -F'\t' -v p="$file_path" '
+		$1 == p { print $2; found=1; exit }
+		index(p, $1 "/") == 1 {
+			l = length($1)
+			if (l > best_len) {
+				best_len = l
+				best_title = $2
+			}
+		}
+		END {
+			if (!found && best_title != "") print best_title
+		}
+	' "$saved_lines")"
+	[[ -z "$title" ]] && title="$fallback_title"
+
+	show_path="$(awk -F'\t' -v p="$file_path" '
+		$1 == p { print $1; found=1; exit }
+		index(p, $1 "/") == 1 {
+			l = length($1)
+			if (l > best_len) {
+				best_len = l
+				best_path = $1
+			}
+		}
+		END {
+			if (!found && best_path != "") print best_path
+		}
+	' "$saved_lines")"
+
+	progress=0
+	if [[ -n "$duration" && "$duration" -gt 0 ]]; then
+		progress=$((position * 100 / duration))
+	fi
+
+	# Remove any existing history row for this exact title key.
+	if [[ -f "$media_history" ]]; then
+		awk -F'\t' -v t="$title" -v p="$file_path" -v sp="$show_path" '
+			$1 == t { next }
+			$3 == p { next }
+			sp != "" && ($3 == sp || index($3, sp "/") == 1) { next }
+			{ print }
+		' "$media_history" > "$media_history.tmp" &&
+			mv "$media_history.tmp" "$media_history"
+	fi
+
+		# Never persist a directory-only path when a concrete media file was played.
+		if [[ ! -f "$file_path" && -n "$played_path" && -f "$played_path" ]]; then
+			file_path="$played_path"
 		fi
 
 		# Append the updated history information to the media history file
 		printf "%s\t%s\t%s\t%s\n" "$title" "$position" "$file_path" "$progress" >> "$media_history"
-	else
-		echo "History File Not Found!"
-	fi
 
 	# Clean up the watchlater directory by removing all files
 	rm -f "$watchlater_dir"/*
 }
 
 check_history(){
-	position="$(grep -hw "$title" $media_history | awk -F'\t' '{print $2}')"
-	file_path="$(grep -hw "$title" $media_history | awk -F'\t' '{print $3}')"
-	progress="$(grep -hw "$title" $media_history | awk -F'\t' '{print $4}')"
+	local show_paths="$1"
+	history_line=""
+	if [[ -f "$media_history" ]]; then
+		history_line="$(awk -F'\t' -v t="$title" -v sp="$show_paths" '
+			BEGIN { n = split(sp, paths, "\n") }
+			{
+				path_match = 0
+				for (i = 1; i <= n; i++) {
+					if (paths[i] != "" && ($3 == paths[i] || index($3, paths[i] "/") == 1)) {
+						path_match = 1
+						break
+					}
+				}
+				is_media_file = ($3 ~ /\.(mkv|mp4)$/)
+				if ($1 == t) {
+					if (is_media_file) {
+						title_file_line = $0
+						title_file_nr = NR
+					}
+					title_line = $0
+					title_nr = NR
+				}
+				if (path_match) {
+					if (is_media_file) {
+						path_file_line = $0
+						path_file_nr = NR
+					}
+					path_line = $0
+					path_nr = NR
+				}
+			}
+			END {
+				if (title_file_nr >= path_file_nr && title_file_line != "") print title_file_line
+				else if (path_file_line != "") print path_file_line
+				else if (title_nr >= path_nr && title_line != "") print title_line
+				else print path_line
+			}
+		' "$media_history")"
+	fi
+
+	if [[ -n "$history_line" ]]; then
+		IFS=$'\t' read -r _ position file_path progress <<< "$history_line"
+	else
+		position=0
+		file_path=""
+		progress=0
+	fi
+
 	dir="${file_path%/*}"
-	episode=$(echo "${file_path##*/}" | sed -n -e 's/.*[eE]\([0-9]\+\).*/\1/p' -e 's/.*\b\([0-9]\+\)\b.*/\1/p' | head -n1)
+	episode=""
+	base_name="${file_path##*/}"
+	if [[ "$base_name" =~ [sS][0-9]{1,2}[eE]([0-9]{1,3})([^0-9]|$) ]]; then
+		episode="${BASH_REMATCH[1]}"
+	elif [[ "$base_name" =~ [Ee]pisode[^0-9]*([0-9]{1,3})([^0-9]|$) ]]; then
+		episode="${BASH_REMATCH[1]}"
+	elif [[ "$base_name" =~ -[[:space:]]*([0-9]{1,3})([^0-9]|$) ]]; then
+		episode="${BASH_REMATCH[1]}"
+	fi
 }
 
 prompt(){
@@ -378,7 +1248,7 @@ prompt(){
 	local show="$1"
 
 	# Check the viewing history for the given show
-	check_history
+	check_history "$show"
 
 	# Initialize episode number and selected directory from saved variables
 	local episode_number="$episode"
@@ -426,24 +1296,39 @@ prompt(){
 		case "$options" in
 			"Next")
 				play_media "$next_episode_file"
-				save_history "$show"
+				save_history "$next_episode_file"
 				prompt "$show"
 				;;
 			"Next Season")
-				play_media "$first_episode_file"
+				next_season_episode="$first_episode_file"
+				if [[ -z "$next_season_episode" && -n "$next_season_dir" ]]; then
+					next_season_episode="$(find -L "$next_season_dir" -maxdepth 1 -type f -iregex '.*\.\(mp4\|mkv\)' | sort -V | head -n1)"
+				fi
+
+				if [[ -z "$next_season_episode" ]]; then
+					notify-send -r 12 -u low -a mediator "mediator" "No playable episode found in next season."
+					prompt "$show"
+					return
+				fi
+
+				if ! play_media "$next_season_episode"; then
+					notify-send -r 12 -u low -a mediator "mediator" "Failed to play next season episode."
+					prompt "$show"
+					return
+				fi
 				# Adjust the show path based on whether the next season directory is already in saved history
 				grep -Fq "$next_season_dir" "$saved_lines" && show="$next_season_dir" || show="${next_season_dir%/*}"
-				save_history "$show"
+				save_history "$next_season_episode"
 				prompt "$show"
 				;;
 			"Resume")
 				play_media "$file_path" "$position"
-				save_history "$show"
+				save_history "$file_path"
 				prompt "$show"
 				;;
 			"Replay")
 				play_media "$file_path"
-				save_history "$show"
+				save_history "$file_path"
 				prompt "$show"
 				;;
 			"Select")
@@ -482,6 +1367,8 @@ list_seasons() {
 # Extract episode numbers and titles, and format the selection
 list_episodes() {
  episode_list="$(echo "$1" | sed -E '
+    # Handle decimal episode numbers like S01E5.5
+    s/.*[sS][0-9]+[Ee]([0-9]+[.][0-9]+)[^0-9]?.*$/Episode \1/; t;
     # Handle [group] tag and metadata in square brackets - ignore group name and metadata
     s/.*\[[^]]*\][[:space:]]+([^ -]+)[[:space:]]+-[[:space:]]+([0-9]+)[[:space:]]+\[.*\].*$/Episode \2/; t;
     # Handle standard episode formats with season and episode numbers, capturing titles after SXXEXX
@@ -504,7 +1391,7 @@ list_episodes() {
     # Handle cases where title is complex and episode number is not in the format
     s/.* - ([^-]+)\..*$/\1/; t;
     # Fallback for movies or files without episode or season numbers
-    s/.* ([^\/]+)\..*$/\1/' | sed -E 's/\./ /g' | sort)"
+    s/.* ([^\/]+)\..*$/\1/')"
 }
 
 get_episodes(){
@@ -514,16 +1401,16 @@ get_episodes(){
 		list_seasons "$(echo "$season_dirs" | sed 's!.*/!!')"
 		season_actual_count="$(printf "%s" "$seasons_list" | uniq -d | wc -l)"
 		episodes=""
-		
+
 		# Check if there are multiple season directories
 		if [[ "$season_actual_count" -ne 1 ]]; then
 			season=$(prompt_menu "$seasons_list" "Select the season:")
 		else
 			season=$(echo "$seasons_list" | uniq -d)
 			# Find and list .mkv or .mp4 files in the given season directories
-			IFS=$'\n'; for line in $(echo -e "$season_dirs"); do
-				# List .mkv or .mp4 files in the current directory
-				video_files=$(find -L "$line" -type f -iregex '.*\.\(mp4\|mkv\)')
+				IFS=$'\n'; for line in $(echo -e "$season_dirs"); do
+					# Load cached episode list for each season directory
+					video_files="$(get_episode_list_for_dir "$line")"
 
 				# Add the video files to the final list if any are found
 				if [[ -n "$video_files" ]]; then
@@ -534,7 +1421,8 @@ get_episodes(){
 			episodes=$(echo -n "$episodes" | sed 's/\n$//' | sort -V)
 		fi
 
-		episodes="$(echo "$episodes" | awk 'match($0,/S([0-9]+)E([0-9]+)/,m){printf "%02d %02d %s\n", m[1], m[2], $0}' | sort -k1,1n -k2,2n | cut -d' ' -f3-)"
+		sorted_episodes="$(echo "$episodes" | awk 'match($0,/S([0-9]+)E([0-9]+)/,m){printf "%02d %02d %s\n", m[1], m[2], $0}' | sort -k1,1n -k2,2n | cut -d' ' -f3-)"
+		[[ -n "$sorted_episodes" ]] && episodes="$sorted_episodes"
 
 		# Exit if no season is selected
 		[[ -z "$season" ]] && exit 1
@@ -546,20 +1434,17 @@ get_episodes(){
 		# Construct the regex pattern based on the presence of a part number
 		if [[ -n "$part_number" ]]; then
 			# Handle part and season combinations (e.g., S01P01, Season 1 - Part 1)
-			season_pattern="([sS]0?$season_number[Pp]0?$part_number|[sS]$season_number[Pp]$part_number|Season[[:space:]]*$season_number[[:space:]]*[-]?[[:space:]]*Part[[:space:]]*$part_number)"
+			season_pattern="([sS]0?${season_number}[Pp]0?${part_number}|[sS]${season_number}[Pp]${part_number}|Season[[:space:]]*${season_number}[[:space:]]*[-]?[[:space:]]*Part[[:space:]]*${part_number})"
 		else
 			# Handle regular season formats (e.g., S01, Season 1) # Fix when Season 01
-			season_pattern="\\b([sS]0?$season_number|Season[[:space:]]*0?$season_number|0?$season_number)\\b"
+			season_pattern="\\b([sS]0?${season_number}|Season[[:space:]]*0?${season_number}|0?${season_number})\\b"
 		fi
 
 		# Check if a valid season number is extracted
 		if [[ -n "$season_number" ]]; then
 			if [[ "$number_of_seasons" -eq 1 ]]; then
-			echo "$season_number"
-			echo "$season_pattern"
 				# If there's only one season, search within the show directory
 				season_dir=$(find -L "$show" -maxdepth 1 -mindepth 1 -type d -printf "%f\n" | sort | grep -E -i "$season_pattern" | head -n1)
-				echo "$season_dir"
 				selected_directory="$show/$season_dir"
 				#echo 1
 			else
@@ -612,62 +1497,167 @@ get_episodes(){
 
 	# List all episodes in the selected directory
 	if [[ -z "$episodes" ]]; then 
-		episodes=$(find -L "$selected_directory" -type f -iregex '.*\.\(mp4\|mkv\)' | awk 'match($0,/S([0-9]+)E([0-9]+)/,m){printf "%02d %02d %s\n", m[1], m[2], $0}' | sort -k1,1n -k2,2n | cut -d' ' -f3-)
+		episodes="$(get_episode_list_for_dir "$selected_directory")"
+		sorted_episodes="$(echo "$episodes" | awk 'match($0,/S([0-9]+)E([0-9]+)/,m){printf "%02d %02d %s\n", m[1], m[2], $0}' | sort -k1,1n -k2,2n | cut -d' ' -f3-)"
+		[[ -n "$sorted_episodes" ]] && episodes="$sorted_episodes"
 	fi
 }
 
 select_episode(){
+	local show="$1"
+	local continue_prompt="${2:-1}"
+	local selection
+	local episode_file
+	local label
+	local idx=0
+	local file_name
+	local ep_num
+	local raw_title
+	local clean_title
+	local menu_lines=()
+	local selection_index
+
 	get_episodes
-
-	list_episodes "$episodes"
-
-	# Check if there's only one episode in the list
-	if [[ $(echo "$episode_list" | wc -l) -eq 1 ]]; then
-		# Automatically select the only episode
-		selection="$episode_list"
-	else
-		# Use Rofi to display a selection menu if multiple episodes are found
-		selection=$(echo "$episode_list" | rofi -sort -dmenu -mesg "Select the episode:" 2>/dev/null)
+	# Hard scope episode candidates to the current show path(s) to avoid cross-show leakage.
+	# Also scope by title to handle loose files from different shows in the same directory.
+	episodes="$(printf "%s\n" "$episodes" | awk -v sp="$show" -v t="$title" '
+		BEGIN { n = split(sp, paths, "\n") }
+		{
+			for (i = 1; i <= n; i++) {
+				if (paths[i] != "" && ($0 == paths[i] || index($0, paths[i] "/") == 1)) {
+					print
+					break
+				}
+			}
+		}
+	' | grep -i "$title")"
+	if [[ -z "$episodes" ]]; then
+		notify-send -r 12 -u low -a mediator "mediator" "No episodes found for this title."
+		return 1
 	fi
 
-	# Map the selected "Episode X: Title" or title without episode number back to the corresponding file name
-	if [[ -n "$selection" ]]; then
-		# Extract episode number if available
-		episode_number=$(echo "$selection" | grep -o '[0-9]\+[^: ]*')
+	mapfile -t episode_files < <(printf "%s\n" "$episodes" | sed '/^$/d')
+	if [[ "${#episode_files[@]}" -eq 0 ]]; then
+		notify-send -r 12 -u low -a mediator "mediator" "No episodes found for this title."
+		return 1
+	fi
 
-		# Extract title if it's prefixed with "Episode X:"
-		episode_title=$(echo "$selection" | sed -E 's/^Episode [0-9]+[^ ]*: (.+)/\1/; t; s/^Episode [0-9]+[^ ]*//; t')
+	# Build clean menu labels while preserving deterministic index->file mapping.
+	for ((idx = 0; idx < ${#episode_files[@]}; idx++)); do
+		file_name="${episode_files[$idx]##*/}"
+		file_name="${file_name%.*}"
+		label=""
+		ep_num=""
+		raw_title=""
+		clean_title=""
 
-		if [[ -n "$episode_title" ]] && ! [[ $selection =~ "Ep" ]]; then
-			# Handle patterns with no episode number, matching by title
-			episode_selection=$(echo "$episodes" | grep -Fi "$episode_title")
-			episode_file="$episode_selection"
-			#episode_file="$selected_directory/$episode_selection"
+		# Episode number extraction.
+		if [[ "$file_name" =~ [sS][0-9]{1,2}[eE]([0-9]+([.][0-9]+)?)([vV][0-9]+)? ]]; then
+			ep_num="${BASH_REMATCH[1]}"
+			# Keep decimal episodes like 5.5, but drop resolution-like tails (e.g. 01.1080).
+			if [[ "$ep_num" =~ ^([0-9]+)[.]([0-9]+)$ ]]; then
+				if (( ${#BASH_REMATCH[2]} > 1 )); then
+					ep_num="${BASH_REMATCH[1]}"
+				fi
+			fi
+			# Keep title only when explicitly separated by '-' or '_' after episode marker.
+			if [[ "$file_name" =~ [sS][0-9]{1,2}[eE][0-9]+([.][0-9]+)?([vV][0-9]+)?[-_][[:space:]]*(.+)$ ]]; then
+				raw_title="${BASH_REMATCH[4]}"
+			fi
+		elif [[ "$file_name" =~ [[:space:]]-[[:space:]]([0-9]+([.][0-9]+)?)[[:space:]]-[[:space:]](.+) ]]; then
+			ep_num="${BASH_REMATCH[1]}"
+			raw_title="${BASH_REMATCH[3]}"
+		elif [[ "$file_name" =~ [[:space:]]-[[:space:]]([0-9]+([.][0-9]+)?)([[:space:]]|$) ]]; then
+			ep_num="${BASH_REMATCH[1]}"
+		fi
+
+		if [[ -n "$raw_title" ]]; then
+			clean_title="$(echo "$raw_title" | sed -E \
+				-e 's/\[[^]]*\]//g' \
+				-e 's/\([^)]*\)//g' \
+				-e 's/[._]+/ /g' \
+				-e 's/^[[:space:]-]+//' \
+				-e 's/[[:space:]-]+$//' \
+				-e 's/[[:space:]]+/ /g')"
+		fi
+
+		if [[ -n "$ep_num" ]]; then
+			[[ -n "$clean_title" ]] && label="Episode ${ep_num} - ${clean_title}" || label="Episode ${ep_num}"
 		else
-			# Handle both patterns with episode number
-			episode_pattern="([sS][0-9]{1,2}[eE]$episode_number|S[0-9]{2}E$episode_number| - Episode $episode_number - .*| - Episode $episode_number\..*| - $episode_number[[:space:]]| - $episode_number[^a-zA-Z0-9]|[_\.x-]$episode_number[^a-zA-Z0-9]|[Ee]pisode[_\.x-]?$episode_number)"
-			episode_selection=$(echo "$episodes" | grep -Ei "$episode_pattern")
-			episode_file="$episode_selection"
-			#episode_file="$selected_directory/$episode_selection"
+			clean_title="$(echo "$file_name" | sed -E \
+				-e 's/\[[^]]*\]//g' \
+				-e 's/\([^)]*\)//g' \
+				-e 's/[._]+/ /g' \
+				-e 's/^[[:space:]-]+//' \
+				-e 's/[[:space:]-]+$//' \
+				-e 's/[[:space:]]+/ /g')"
+			[[ -n "$clean_title" ]] && label="$clean_title" || label="$file_name"
 		fi
 
-		if [[ -n "$episode_file" ]]; then
-			play_media "$episode_file"
-			save_history "$show"
-			prompt "$show"
+		menu_lines+=("$label")
+	done
+
+	if [[ "${#menu_lines[@]}" -eq 1 ]]; then
+		episode_file="${episode_files[0]}"
+	else
+		selection_index="$(printf "%s\n" "${menu_lines[@]}" | rofi -sort -dmenu -mesg "Select the episode:" -format i 2>/dev/null)"
+		[[ -z "$selection_index" ]] && return 0
+		if (( selection_index >= 0 && selection_index < ${#episode_files[@]} )); then
+			episode_file="${episode_files[$selection_index]}"
 		fi
+	fi
+
+	if [[ -n "$episode_file" ]]; then
+		play_media "$episode_file"
+		save_history "$episode_file"
+		[[ "$continue_prompt" == "1" ]] && prompt "$show"
 	fi
 }
 
 play_history(){
 	media_type="$1"
 	title="$2"
+	launch_path="$3"
+	# Reset cross-run state so one show's season data doesn't leak into another.
+	season_dirs=""
+	episodes=""
+	season=""
+	season_dir=""
+	selected_directory=""
+	next_episode_file=""
+	next_season_dir=""
+	first_episode_file=""
+	season_actual_count=0
 
 	# Define paths for saved history based on media type
 	saved_lines="$data_dir/$media_type/${media_type}.txt"
 
-	# Extract show information matching the title
-	show=$(grep "$title$" "$saved_lines" | cut -f1)
+	# Extract all show paths for this title so season selection is available when duplicates exist.
+	# Normalize file paths to their parent directories to handle loose episodes (e.g. Invincible S04E01.mkv
+	# directly in Shows/ without a subdirectory).
+	raw_show="$(awk -F'\t' -v t="$title" '$2 == t {print $1}' "$saved_lines")"
+	show=""
+	while IFS= read -r path; do
+		[[ -z "$path" ]] && continue
+		if [[ -f "$path" ]]; then
+			show+="$(dirname "$path")"$'\n'
+		else
+			show+="$path"$'\n'
+		fi
+	done <<< "$raw_show"
+	show="$(echo "$show" | sed '/^$/d' | sort -u)"
+	# Fallback to explicit launch path when title lookup is missing/unique.
+	if [[ -z "$show" && -n "$launch_path" ]]; then
+		if [[ -f "$launch_path" ]]; then
+			show="$(dirname "$launch_path")"
+		else
+			show="$launch_path"
+		fi
+	fi
+	if [[ -z "$show" ]]; then
+		notify-send -r 12 -u low -a mediator "mediator" "No media path found for title: $title"
+		return 1
+	fi
 
 	# Count number of seasons for the show
 	number_of_seasons="$(printf "%s" "$show" | grep -c '^')"
@@ -676,44 +1666,42 @@ play_history(){
 	[[ "$media_type" == "anime" ]] && speed="1.0"
 
 	# Check the playback history for the show
-	check_history
+	check_history "$show"
 
 	# Use episode and directory variables
 	local episode_number="$episode"
-	local selected_directory="$dir"
+		local selected_directory="$dir"
 
-	# Check for the next episode in the current season
-	get_next_episode() {
-		# Check the format of the current episode number
-		total_digits=${#episode_number}
+		# Check for the next episode in the current season
+			get_next_episode() {
+				local episode_source
+				episode_source="$(get_episode_list_for_dir "$selected_directory")"
+				next_episode_file="$(printf "%s\n" "$episode_source" | awk -v cur="$file_path" 'found { print; exit } $0 == cur { found = 1 }')"
+			}
 
-		# Increment the episode number while maintaining leading zeros
-		next_episode_number=$(printf "%0${total_digits}d" $((10#$episode_number + 1)))
-
-		# Create a regex pattern for matching the episode files
-		next_episode_pattern="([sS][0-9]+[eE]$next_episode_number| - $next_episode_number - | - $next_episode_number[[:space:]]| - $next_episode_number[^a-zA-Z0-9]|[_\.x-]$next_episode_number[^a-zA-Z0-9])"
-		next_episode_file=$(echo "$episodes" | sort -V | grep -Ei "$next_episode_pattern")	
-	}
-
-	get_next_season(){
-		# Check if there is another season available
-		next_season_dir="$(echo "$season_dirs" | grep -FA1 "$selected_directory" | tail -n1 | grep -vxF "$selected_directory")"
-		if [[ -n "$next_season_dir" ]]; then 
-			first_episode_file=$(find -L "$next_season_dir" -maxdepth 1 -type f -iregex '.*\.\(mp4\|mkv\)' | sort -V | head -n1)
-		#else
-			#sed -i "/$title/d" "$media_history" 
-		fi
-	}
+		get_next_season(){
+			# Check if there is another season available
+			next_season_dir="$(echo "$season_dirs" | grep -FA1 "$selected_directory" | tail -n1 | grep -vxF "$selected_directory")"
+			if [[ -n "$next_season_dir" ]]; then 
+				first_episode_file="$(get_episode_list_for_dir "$next_season_dir" | head -n1)"
+			#else
+				#sed -i "/$title/d" "$media_history" 
+			fi
+		}
 
 	# Check if there are multiple season directories, only if there are no video files in the directory
 	if [[ "$number_of_seasons" -gt 1 && -z "$season_dirs" ]]; then
 		IFS=$'\n' ; for line in $(echo -e "$show"); do
+			# If the path is a file, normalize to its parent directory (handles loose episodes).
+			if [[ -f "$line" ]]; then
+				line="$(dirname "$line")"
+			fi
 			# Find directories inside the current line
 			subdirs=$(find -L "$line" -maxdepth 1 -mindepth 1 -type d)
 
 			# Loop through each subdir to check if it contains video files
 			if [[ -n "$subdirs" ]]; then 
-				for subdir in "$subdirs"; do
+				for subdir in $subdirs; do
 					# Check if the subdir contains video files
 					if find -L "$subdir" -maxdepth 1 -type f -iregex '.*\.\(mp4\|mkv\)' | grep -q .; then
 						season_dirs+="${subdir}"$'\n'
@@ -721,11 +1709,11 @@ play_history(){
 				done
 			fi
 
-			# If no subdirectories were found with video files, check if the current directory has videos
-			if [[ -z "$subdirs" ]] || [[ -n $(find -L "$line" -maxdepth 1 -type f -iregex '.*\.\(mp4\|mkv\)' | grep .) ]]; then
-				season_dirs+="${line}"$'\n'
-			fi
-		done
+				# If no subdirectories were found with video files, check if the current directory has videos
+				if [[ -z "$subdirs" ]] || find -L "$line" -maxdepth 1 -type f -iregex '.*\.\(mp4\|mkv\)' -print -quit | grep -q .; then
+					season_dirs+="${line}"$'\n'
+				fi
+			done
 	elif [[ -z "$(find -L "$show" -maxdepth 1 -type f -iregex '.*\.\(mp4\|mkv\)')" && -z "$season_dirs" ]]; then
 		season_dirs="$(find -L "$show" -maxdepth 1 -mindepth 1 -type d)"
 	fi
@@ -756,7 +1744,10 @@ play_history(){
 			else
 				# User chose not to binge the next season, clear file path and remove history entry
 				file_path=""
-				sed -i "/$title/d" "$media_history"
+				if [[ -f "$media_history" ]]; then
+					awk -F'\t' -v t="$title" '$1 != t' "$media_history" > "$media_history.tmp" &&
+						mv "$media_history.tmp" "$media_history"
+				fi
 			fi
 		fi
 	fi
@@ -769,12 +1760,12 @@ play_history(){
 		play_media "$file_path" "$position"
 		# Check if current directory is in the show path, adjust show variable accordingly
 		grep -Fq "$dir" <<< "$show" && 	show="$dir" || show="${dir%/*}"
-		save_history "$show"
+		save_history "$file_path"
 		prompt "$show"
 	elif [[ "$binge_next_season" == "Yes" ]]; then
 		# Binge-watch the next season
 		play_media "$file_path" "$position"
-		save_history "$show"
+		save_history "$file_path"
 		prompt "$show"
 	else
 		# If no specific file path, either play a media file or select an episode
@@ -783,24 +1774,58 @@ play_history(){
 			save_history "$show"
 			prompt "$show"
 		else
-			select_episode
+			select_episode "$show" 1
 		fi
 	fi
 }
 
 configuration
+check_dependencies
+
+if [[ -z "$MEDIATOR_DETACHED" && -t 1 ]]; then
+	should_detach=0
+	for arg in "$@"; do
+		case "$arg" in
+			--movies|--shows|--anime|--episode|--jellyfin-anime|--jellyfin-shows|--jellyfin-movies)
+				should_detach=1
+				;;
+			--edit|-e|--jellyfin-login|--clear|--fix)
+				should_detach=0
+				break
+				;;
+		esac
+	done
+	if [[ "$should_detach" -eq 1 ]]; then
+		MEDIATOR_DETACHED=1 nohup "$0" "$@" >/dev/null 2>&1 &
+		disown 2>/dev/null || true
+		exit 0
+	fi
+fi
 
 # Parse options
 while [[ $# -gt 0 ]]; do
 	case "$1" in
-		-s | --syncplay) player="syncplay" && shift ;;
+		-s | --syncplay)
+			if ! command -v syncplay >/dev/null 2>&1; then
+				echo "Error: syncplay is not installed." >&2
+				exit 1
+			fi
+			player="syncplay"
+			speed="1.0"
+			shift
+			;;
 		--movies|--shows|--anime)
 			process_media "${1#--}" ; rm -r "$shortcuts"
 			shift # Move to next argument
 			;;
 		--episode)
-			play_history "$2" "$3"
-			shift 3 # Move past --episode and its two arguments
+			if [[ -n "$4" && "$4" != --* ]]; then
+				play_history "$2" "$3" "$4"
+				shift 4 # Move past --episode and its three arguments
+			else
+				play_history "$2" "$3"
+				shift 3 # Backward compatibility for existing entries
+			fi
 			;;
 		--clear)
 			[[ -f "$media_history" ]] && rm "$media_history" && echo "History Cleared!"
@@ -814,8 +1839,24 @@ while [[ $# -gt 0 ]]; do
 			xdg-open "$config_file"
 			shift # Move to next argument
 			;;
+		--jellyfin-login)
+			jellyfin_login
+			shift
+			;;
+		--jellyfin-anime)
+			jellyfin_anime
+			shift
+			;;
+		--jellyfin-shows)
+			jellyfin_shows
+			shift
+			;;
+		--jellyfin-movies)
+			jellyfin_movies
+			shift
+			;;
 		*)
-			echo "Invalid option. Use --movies, --shows, --anime, --episode, --edit"
+			echo "Invalid option. Use --movies, --shows, --anime, --episode, --edit, --jellyfin-login, --jellyfin-anime, --jellyfin-shows, --jellyfin-movies"
 			exit 1
 			;;
 	esac
