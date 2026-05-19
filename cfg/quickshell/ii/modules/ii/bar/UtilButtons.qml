@@ -1,4 +1,5 @@
 import qs
+import qs.services
 import qs.modules.common
 import qs.modules.common.widgets
 import QtQuick
@@ -36,18 +37,49 @@ Item {
             }
         }
 
+        // Recording Button
         Loader {
             active: Config.options.bar.utilButtons.showScreenRecord
             visible: Config.options.bar.utilButtons.showScreenRecord
-            sourceComponent: CircleUtilButton {
+            sourceComponent: RowLayout {
+                spacing: 6
                 Layout.alignment: Qt.AlignVCenter
-                onClicked: Quickshell.execDetached(["bash", "-c", `recorder --screen`])
-                MaterialSymbol {
-                    horizontalAlignment: Qt.AlignHCenter
-                    fill: 1
-                    text: Config.options.bar.utilButtons.showDarkModeToggle ? "stop_circle" : "screen_record"
-                    iconSize: Appearance.font.pixelSize.large
-                    color: Appearance.colors.colOnLayer2
+
+                // Duration (only when recording)
+                StyledText {
+                    visible: Recording.isRecording
+                    text: Recording.formatDuration(Recording.recordingDuration)
+                    color: Recording.isPaused ? "#ffaa00" : Appearance.colors.colError
+                    font.pixelSize: Appearance.font.pixelSize.small
+                    font.weight: Font.Medium
+                    font.family: Appearance.font.family.numbers
+                }
+
+                // Stop/Pause button (when recording)
+                CircleUtilButton {
+                    visible: Recording.isRecording
+                    onClicked: Recording.stopRecording()
+                    altAction: Recording.togglePause
+                    MaterialSymbol {
+                        horizontalAlignment: Qt.AlignHCenter
+                        fill: 1
+                        text: Recording.isPaused ? "pause_circle" : "stop_circle"
+                        iconSize: Appearance.font.pixelSize.large
+                        color: Recording.isPaused ? "#ffaa00" : Appearance.colors.colError
+                    }
+                }
+
+                // Record button (when not recording)
+                CircleUtilButton {
+                    visible: !Recording.isRecording
+                    onClicked: Recording.startRecording(true)
+                    MaterialSymbol {
+                        horizontalAlignment: Qt.AlignHCenter
+                        fill: 1
+                        text: "screen_record"
+                        iconSize: Appearance.font.pixelSize.large
+                        color: Appearance.colors.colOnLayer2
+                    }
                 }
             }
         }
@@ -107,9 +139,9 @@ Item {
                 Layout.alignment: Qt.AlignVCenter
                 onClicked: event => {
                     if (Appearance.m3colors.darkmode) {
-                        Hyprland.dispatch(`exec ${Directories.wallpaperSwitchScriptPath} --mode light --noswitch`);
+                        Quickshell.execDetached(["bash", "-c", `${Directories.wallpaperSwitchScriptPath} --mode light --noswitch`])
                     } else {
-                        Hyprland.dispatch(`exec ${Directories.wallpaperSwitchScriptPath} --mode dark --noswitch`);
+                        Quickshell.execDetached(["bash", "-c", `${Directories.wallpaperSwitchScriptPath} --mode dark --noswitch`])
                     }
                 }
                 MaterialSymbol {

@@ -399,6 +399,10 @@ Singleton {
 
             property JsonObject notifications: JsonObject {
                 property int timeout: 7000
+                property JsonObject monitor: JsonObject {
+                    property bool enable: false
+                    property string name: "" // Name of the monitor to show notifications on, like "eDP-1". Find out with 'hyprctl monitors' command
+                }
             }
 
             property JsonObject osd: JsonObject {
@@ -411,9 +415,9 @@ Singleton {
             }
 
             property JsonObject overlay: JsonObject {
-                property bool openingZoomAnimation: false
+                property bool openingZoomAnimation: true
                 property bool darkenScreen: true
-                property real clickthroughOpacity: 0.7
+                property real clickthroughOpacity: 0.8
                 property JsonObject floatingImage: JsonObject {
                     property string imageSource: "https://media.tenor.com/H5U5bJzj3oAAAAAi/kukuru.gif"
                     property real scale: 0.5
@@ -527,6 +531,7 @@ Singleton {
                         property list<var> toggles: [
                             { "size": 2, "type": "network" },
                             { "size": 2, "type": "bluetooth"  },
+                            { "size": 1, "type": "vpn" },
                             { "size": 1, "type": "idleInhibitor" },
                             { "size": 1, "type": "audio" },
                             { "size": 2, "type": "nightLight" },
@@ -605,6 +610,26 @@ Singleton {
                 }
             }
 
+            property JsonObject waffles: JsonObject {
+                // Some spots are kinda janky/awkward. Setting the following to
+                // false will make (some) stuff also be like that for accuracy. 
+                // Example: the right-click menu of the Start button
+                property JsonObject tweaks: JsonObject {
+                    property bool switchHandlePositionFix: true
+                    property bool smootherMenuAnimations: true
+                    property bool smootherSearchBar: true
+                }
+                property JsonObject bar: JsonObject {
+                    property bool bottom: true
+                    property bool leftAlignApps: false
+                }
+                property JsonObject actionCenter: JsonObject {
+                    property list<string> toggles: [ "network", "bluetooth", "easyEffects", "powerProfile", "idleInhibitor", "nightLight", "darkMode", "antiFlashbang", "cloudflareWarp", "mic", "musicRecognition", "notifications", "onScreenKeyboard", "gameMode", "screenSnip", "colorPicker" ]
+                }
+                property JsonObject calendar: JsonObject {
+                    property bool force2CharDayOfWeek: true
+                }
+            }
         }
     }
 }

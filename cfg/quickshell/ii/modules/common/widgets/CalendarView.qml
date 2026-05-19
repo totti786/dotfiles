@@ -44,10 +44,7 @@ Item {
 
     Behavior on weekDiff {
         id: weekScrollBehavior
-        NumberAnimation {
-            duration: 200
-            easing.type: Easing.OutCubic
-        }
+        animation: Looks.transition.scroll.createObject(this)
     }
     Timer {
         id: scrollAnimationCheckTimer
